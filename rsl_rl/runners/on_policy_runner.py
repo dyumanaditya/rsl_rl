@@ -22,6 +22,13 @@ class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+<<<<<<< Updated upstream
+=======
+        print("I AM HEREEEEEEEE")
+        print("I AM HEREEEEEEEE")
+        print("I AM HEREEEEEEEE")
+        print("I AM HEREEEEEEEE")
+>>>>>>> Stashed changes
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
@@ -88,6 +95,10 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+        # Optional discriminator (AMPDiscriminator / ADDDiscriminator).
+        # Set before learn() to interleave disc training with each PPO update.
+        self.discriminator = None
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -210,9 +221,18 @@ class OnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
+<<<<<<< Updated upstream
             # Logging info and save checkpoint
             if self.log_dir is not None:
                 # Log information
+=======
+            # Train discriminator (AMP / ADD) after each PPO update
+            disc_info = self._update_discriminator() if self.discriminator is not None else {}
+
+            # Logging info and save checkpoint
+            if self.log_dir is not None:
+                # Log information — disc_info is in locals() automatically
+>>>>>>> Stashed changes
                 self.log(locals())
                 # Save model
                 if it % self.save_interval == 0:
@@ -233,6 +253,24 @@ class OnPolicyRunner:
         # Save the final model after training
         if self.log_dir is not None:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+<<<<<<< Updated upstream
+=======
+
+    def _update_discriminator(self) -> dict:
+        """Train discriminator (AMP / ADD) for one iteration after the PPO update.
+
+        Reads disc_obs from self.env.base_env (duck-typed for G1ImitationEnv).
+        Returns a dict of metrics for logging.
+        """
+        base_env = getattr(self.env, "base_env", self.env)
+        agent_obs = base_env.disc_obs.detach()
+        im_mode = getattr(getattr(base_env, "_im_cfg", None), "mode", "amp")
+        if im_mode == "add":
+            demo_obs = base_env._disc_obs_demo.detach()
+        else:
+            demo_obs = base_env.fetch_disc_obs_demo(agent_obs.shape[0])
+        return self.discriminator.update(agent_obs, demo_obs)
+>>>>>>> Stashed changes
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -346,6 +384,18 @@ class OnPolicyRunner:
             #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
         log_string += ep_string
+
+        # -- Discriminator (AMP / ADD)
+        disc_info = locs.get("disc_info", {})
+        if disc_info:
+            self.writer.add_scalar("Disc/loss", disc_info["disc_loss"], locs["it"])
+            self.writer.add_scalar("Disc/agent_acc", disc_info["disc_agent_acc"], locs["it"])
+            self.writer.add_scalar("Disc/demo_acc", disc_info["disc_demo_acc"], locs["it"])
+            log_string += (
+                f"""{'Disc loss:':>{pad}} {disc_info['disc_loss']:.4f}\n"""
+                f"""{'Disc agent/demo acc:':>{pad}} {disc_info['disc_agent_acc']:.2f} / {disc_info['disc_demo_acc']:.2f}\n"""
+            )
+
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
@@ -378,6 +428,13 @@ class OnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, self.current_learning_iteration)
 
+<<<<<<< Updated upstream
+=======
+        # Save discriminator alongside the policy checkpoint
+        if self.discriminator is not None:
+            self.discriminator.save(path.replace(".pt", "_disc.pt"))
+
+>>>>>>> Stashed changes
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load PPO model
