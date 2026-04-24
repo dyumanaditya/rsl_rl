@@ -92,6 +92,9 @@ class OnPolicyRunner:
         # Optional discriminator (AMPDiscriminator / ADDDiscriminator).
         # Set before learn() to interleave disc training with each PPO update.
         self.discriminator = None
+        # Pre-allocated buffers for per-step disc_obs collection (set in learn()).
+        self._disc_obs_buf = None
+        self._disc_demo_obs_buf = None
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -142,13 +145,25 @@ class OnPolicyRunner:
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        # Allocate per-step disc_obs collection buffers (pre-allocated to avoid inference-tensor issues)
+        if self.discriminator is not None:
+            base_env = getattr(self.env, "base_env", self.env)
+            disc_obs_size = base_env.disc_obs_size
+            im_cfg = base_env._im_cfg
+            self._disc_obs_buf = torch.zeros(
+                self.num_steps_per_env, self.env.num_envs, disc_obs_size, device=self.device
+            )
+            self._disc_demo_obs_buf = (
+                torch.zeros_like(self._disc_obs_buf) if im_cfg.mode == "add" else None
+            )
+
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
+                for step in range(self.num_steps_per_env):
                     # Sample actions from policy
                     actions = self.alg.act(obs, critic_obs)
                     # Step environment
@@ -165,10 +180,18 @@ class OnPolicyRunner:
                     else:
                         critic_obs = obs
 
+                    # Collect disc_obs into pre-allocated buffers.
+                    # copy_() onto a regular (non-inference) destination tensor preserves its type,
+                    # so _disc_obs_buf remains usable outside inference_mode for disc training.
+                    if self._disc_obs_buf is not None and "disc_obs" in infos:
+                        self._disc_obs_buf[step].copy_(infos["disc_obs"])
+                        if self._disc_demo_obs_buf is not None and "disc_obs_demo" in infos:
+                            self._disc_demo_obs_buf[step].copy_(infos["disc_obs_demo"])
+
                     # Intrinsic rewards (extracted here only for logging)!
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
-                    # Process env step and store in buffer
+                    # Process env step and store in buffer (pure task rewards — disc added below)
                     self.alg.process_env_step(rewards, dones, infos)
 
                     if self.log_dir is not None:
@@ -203,8 +226,31 @@ class OnPolicyRunner:
                 stop = time.time()
                 collection_time = stop - start
 
+            # Inject disc rewards into the rollout storage and compute value-function returns.
+            # Done outside inference_mode so _disc_obs_buf tensors are safe for autograd in disc training.
+            start = stop
+            mean_disc_reward = 0.0
+            with torch.no_grad():
+                if self.discriminator is not None and self._disc_obs_buf is not None:
+                    base_env = getattr(self.env, "base_env", self.env)
+                    im_cfg = base_env._im_cfg
+                    disc_obs_flat = self._disc_obs_buf.flatten(0, 1)   # (T*N, obs_size)
+
+                    if im_cfg.mode == "add" and self._disc_demo_obs_buf is not None:
+                        disc_r = self.discriminator.compute_rewards(
+                            disc_obs_flat, self._disc_demo_obs_buf.flatten(0, 1)
+                        )
+                    else:
+                        disc_r = self.discriminator.compute_rewards(disc_obs_flat)
+
+                    mean_disc_reward = disc_r.mean().item()
+                    disc_r_storage = disc_r.view(self.num_steps_per_env, self.env.num_envs, 1)
+                    # storage.rewards holds pure task rewards; blend in disc signal now
+                    self.alg.storage.rewards.mul_(im_cfg.task_reward_weight).add_(
+                        im_cfg.disc_reward_weight * disc_r_storage
+                    )
+
                 # Learning step
-                start = stop
                 self.alg.compute_returns(critic_obs)
 
             # Update policy
@@ -214,7 +260,7 @@ class OnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            # Train discriminator (AMP / ADD) after each PPO update
+            # Train discriminator on full rollout disc_obs (all T*N samples)
             disc_info = self._update_discriminator() if self.discriminator is not None else {}
 
             # Logging info and save checkpoint
@@ -242,18 +288,22 @@ class OnPolicyRunner:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def _update_discriminator(self) -> dict:
-        """Train discriminator (AMP / ADD) for one iteration after the PPO update.
+        """Train discriminator (AMP / ADD) on the full rollout's disc_obs.
 
-        Reads disc_obs from self.env.base_env (duck-typed for G1ImitationEnv).
-        Returns a dict of metrics for logging.
+        Uses the pre-allocated _disc_obs_buf (shape: num_steps × num_envs × obs_size)
+        filled during the rollout, providing T*N samples per update instead of just N.
         """
         base_env = getattr(self.env, "base_env", self.env)
-        agent_obs = base_env.disc_obs.detach()
-        im_mode = getattr(getattr(base_env, "_im_cfg", None), "mode", "amp")
-        if im_mode == "add":
-            demo_obs = base_env._disc_obs_demo.detach()
+        im_cfg = base_env._im_cfg
+
+        # Flatten to (T*N, obs_size) — these are regular tensors, safe for autograd
+        agent_obs = self._disc_obs_buf.flatten(0, 1)
+
+        if im_cfg.mode == "add" and self._disc_demo_obs_buf is not None:
+            demo_obs = self._disc_demo_obs_buf.flatten(0, 1)
         else:
             demo_obs = base_env.fetch_disc_obs_demo(agent_obs.shape[0])
+
         return self.discriminator.update(agent_obs, demo_obs)
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
@@ -371,13 +421,16 @@ class OnPolicyRunner:
 
         # -- Discriminator (AMP / ADD)
         disc_info = locs.get("disc_info", {})
+        mean_disc_reward = locs.get("mean_disc_reward", 0.0)
         if disc_info:
             self.writer.add_scalar("Disc/loss", disc_info["disc_loss"], locs["it"])
             self.writer.add_scalar("Disc/agent_acc", disc_info["disc_agent_acc"], locs["it"])
             self.writer.add_scalar("Disc/demo_acc", disc_info["disc_demo_acc"], locs["it"])
+            self.writer.add_scalar("Disc/mean_reward", mean_disc_reward, locs["it"])
             log_string += (
                 f"""{'Disc loss:':>{pad}} {disc_info['disc_loss']:.4f}\n"""
                 f"""{'Disc agent/demo acc:':>{pad}} {disc_info['disc_agent_acc']:.2f} / {disc_info['disc_demo_acc']:.2f}\n"""
+                f"""{'Disc mean reward:':>{pad}} {mean_disc_reward:.4f}\n"""
             )
 
         log_string += (
