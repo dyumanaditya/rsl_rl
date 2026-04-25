@@ -144,6 +144,9 @@ class OnPolicyRunner:
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        # disc reward per-episode buffer (accumulated after rollout from stored disc_r)
+        disc_rewbuffer = deque(maxlen=100)
+        cur_disc_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # Allocate per-step disc_obs collection buffers (pre-allocated to avoid inference-tensor issues)
         if self.discriminator is not None:
@@ -249,6 +252,15 @@ class OnPolicyRunner:
                     self.alg.storage.rewards.mul_(im_cfg.task_reward_weight).add_(
                         im_cfg.disc_reward_weight * disc_r_storage
                     )
+
+                    # Accumulate disc reward per-episode for logging
+                    if self.log_dir is not None:
+                        stored_dones = self.alg.storage.dones  # (T, N, 1)
+                        for step in range(self.num_steps_per_env):
+                            cur_disc_reward_sum += disc_r_storage[step].squeeze(-1)
+                            new_ids = (stored_dones[step].squeeze(-1) > 0).nonzero(as_tuple=False)
+                            disc_rewbuffer.extend(cur_disc_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_disc_reward_sum[new_ids] = 0
 
                 # Learning step
                 self.alg.compute_returns(critic_obs)
@@ -369,6 +381,9 @@ class OnPolicyRunner:
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
+        # disc reward per-episode (primary training signal for AMP/ADD)
+        if len(locs.get("disc_rewbuffer", [])) > 0:
+            self.writer.add_scalar("Train/mean_disc_reward", statistics.mean(locs["disc_rewbuffer"]), locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
@@ -432,6 +447,8 @@ class OnPolicyRunner:
                 f"""{'Disc agent/demo acc:':>{pad}} {disc_info['disc_agent_acc']:.2f} / {disc_info['disc_demo_acc']:.2f}\n"""
                 f"""{'Disc mean reward:':>{pad}} {mean_disc_reward:.4f}\n"""
             )
+        if len(locs.get("disc_rewbuffer", [])) > 0:
+            log_string += f"""{'Mean disc ep reward:':>{pad}} {statistics.mean(locs['disc_rewbuffer']):.2f}\n"""
 
         log_string += (
             f"""{'-' * width}\n"""
