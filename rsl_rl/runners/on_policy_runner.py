@@ -131,6 +131,8 @@ class OnPolicyRunner:
         critic_obs = extras["observations"].get("critic", obs)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
+        obs = self.obs_normalizer(obs)
+        critic_obs = self.critic_obs_normalizer(critic_obs)
 
         # Book keeping
         ep_infos = []
@@ -287,7 +289,7 @@ class OnPolicyRunner:
             ep_infos.clear()
 
             # Save code state
-            if it == start_iter:
+            if it == start_iter and self.log_dir is not None:
                 # obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
                 # if possible store them to wandb
