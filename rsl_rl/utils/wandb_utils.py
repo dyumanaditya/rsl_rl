@@ -29,17 +29,20 @@ class WandbSummaryWriter(SummaryWriter):
         # Prefer entity from config; fall back to WANDB_USERNAME env var
         entity = cfg.get("wandb_entity") or os.environ.get("WANDB_USERNAME") or None
 
-        wandb.init(project=project, entity=entity)
+        run_name = os.path.basename(log_dir)
 
-        # Change generated name to project-number format
-        wandb.run.name = project + wandb.run.name.split("-")[-1]
+        wandb.init(
+            project=project,
+            entity=entity,
+            dir=log_dir,
+            name=run_name,
+            resume="allow",
+        )
 
         self.name_map = {
             "Train/mean_reward/time": "Train/mean_reward_time",
             "Train/mean_episode_length/time": "Train/mean_episode_length_time",
         }
-
-        run_name = os.path.split(log_dir)[-1]
 
         wandb.log({"log_dir": run_name})
 
