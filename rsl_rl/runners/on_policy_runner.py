@@ -306,6 +306,9 @@ class OnPolicyRunner:
 
         Uses the pre-allocated _disc_obs_buf (shape: num_steps × num_envs × obs_size)
         filled during the rollout, providing T*N samples per update instead of just N.
+
+        disc_batch_size in im_cfg is per-env (like MimicKit). Scale by num_envs so
+        the number of gradient steps matches MimicKit's ~ceil(T / disc_batch_size) * epochs.
         """
         base_env = getattr(self.env, "base_env", self.env)
         im_cfg = base_env._im_cfg
@@ -318,7 +321,9 @@ class OnPolicyRunner:
         else:
             demo_obs = base_env.fetch_disc_obs_demo(agent_obs.shape[0])
 
-        return self.discriminator.update(agent_obs, demo_obs)
+        # Scale batch size by num_envs to match MimicKit's per-env convention.
+        effective_batch = max(1, im_cfg.disc_batch_size * self.env.num_envs)
+        return self.discriminator.update(agent_obs, demo_obs, batch_size=effective_batch)
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
