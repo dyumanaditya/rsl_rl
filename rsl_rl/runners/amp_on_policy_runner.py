@@ -92,12 +92,17 @@ class AMPOnPolicyRunner:
         # ------------------------------------------------------------------
         hidden_dims = getattr(im_cfg, "hidden_dims", [1024, 512])
         empirical_norm = getattr(im_cfg, "empirical_normalization", False)
+        # ADD uses DiffNorm (scale by mean absolute diff); AMP uses standard norm.
+        disc_norm_kwargs = (
+            {"diff_normalization": True} if im_cfg.mode == "add"
+            else {"empirical_normalization": empirical_norm}
+        )
         discriminator = Discriminator(
             input_dim=disc_obs_size,
             hidden_layer_sizes=hidden_dims,
             reward_scale=im_cfg.disc_reward_scale,
             device=self.device,
-            empirical_normalization=empirical_norm,
+            **disc_norm_kwargs,
         ).to(self.device)
 
         # ------------------------------------------------------------------

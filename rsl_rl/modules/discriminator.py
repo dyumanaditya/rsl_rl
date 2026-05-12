@@ -21,6 +21,33 @@ from torch.nn import functional as F
 from rsl_rl.modules.normalizer import EmpiricalNormalization
 
 
+class DiffNormalization(nn.Module):
+    """ADD-style normalizer: scale inputs by running mean absolute value.
+
+    Zeros (the expert class in ADD) normalize to exactly zero — unlike
+    EmpiricalNormalization which shifts them by the running mean.
+    """
+
+    def __init__(self, shape: list[int], min_abs: float = 1e-4) -> None:
+        super().__init__()
+        self.register_buffer("mean_abs", torch.ones(shape))
+        self.register_buffer("count", torch.tensor(0.0))
+        self.min_abs = min_abs
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x / torch.clamp_min(self.mean_abs, self.min_abs)
+
+    def update(self, x: torch.Tensor) -> None:
+        x = x.detach().float()
+        x_flat = x.reshape(-1, self.mean_abs.shape[-1])
+        n = float(x_flat.shape[0])
+        if n == 0:
+            return
+        total = self.count + n
+        self.mean_abs += (x_flat.abs().mean(0) - self.mean_abs) * n / total.clamp(min=1)
+        self.count = total
+
+
 class Discriminator(nn.Module):
     """AMP/ADD discriminator for single-obs input.
 
@@ -47,6 +74,7 @@ class Discriminator(nn.Module):
         reward_clamp_epsilon: float = 1.0e-4,
         device: str | torch.device = "cpu",
         empirical_normalization: bool = False,
+        diff_normalization: bool = False,
     ) -> None:
         super().__init__()
 
@@ -64,9 +92,10 @@ class Discriminator(nn.Module):
         self.trunk = nn.Sequential(*layers)
         self.linear = nn.Linear(curr_in, 1)
 
-        self.empirical_normalization = empirical_normalization
-        if empirical_normalization:
-            self.obs_normalizer: nn.Module = EmpiricalNormalization(shape=[input_dim])
+        if diff_normalization:
+            self.obs_normalizer: nn.Module = DiffNormalization(shape=[input_dim])
+        elif empirical_normalization:
+            self.obs_normalizer = EmpiricalNormalization(shape=[input_dim])
         else:
             self.obs_normalizer = nn.Identity()
 
@@ -106,20 +135,24 @@ class Discriminator(nn.Module):
         expert_d: torch.Tensor,
         expert_obs: torch.Tensor,
         lambda_: float = 10.0,
+        policy_obs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (amp_loss, grad_pen_loss) for combining with PPO loss.
 
         Args:
             policy_d: Discriminator logits for policy (agent) samples.
             expert_d: Discriminator logits for expert (demo) samples.
-            expert_obs: Raw (pre-normalised) expert obs – used for the R1
-                gradient penalty.
+            expert_obs: Raw (pre-normalised) expert obs – R1 gradient penalty anchor.
             lambda_: R1 penalty coefficient.
+            policy_obs: If provided, also compute gradient penalty at policy samples
+                (two-sided GP matching MimicKit ADD; pass for ADD mode, omit for AMP).
         """
         expert_loss = self.loss_fun(expert_d, torch.ones_like(expert_d))
         policy_loss = self.loss_fun(policy_d, torch.zeros_like(policy_d))
         amp_loss = 0.5 * (expert_loss + policy_loss)
         grad_pen = self.compute_grad_pen(expert_obs, lambda_)
+        if policy_obs is not None:
+            grad_pen = grad_pen + self.compute_grad_pen(policy_obs, lambda_)
         return amp_loss, grad_pen
 
     def compute_grad_pen(self, expert_obs: torch.Tensor, lambda_: float = 10.0) -> torch.Tensor:
@@ -139,8 +172,8 @@ class Discriminator(nn.Module):
         return 0.5 * lambda_ * grad.pow(2).sum(dim=1).mean()
 
     def update_normalization(self, *batches: torch.Tensor) -> None:
-        """Update empirical normaliser statistics (no-op when disabled)."""
-        if not self.empirical_normalization:
+        """Update normaliser statistics (no-op when using nn.Identity)."""
+        if isinstance(self.obs_normalizer, nn.Identity):
             return
         with torch.no_grad():
             for batch in batches:

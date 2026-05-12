@@ -370,6 +370,7 @@ class AMP_PPO:
                 expert_d=expert_d,
                 expert_obs=expert_batch,
                 lambda_=self.grad_penalty_coeff,
+                policy_obs=disc_policy_batch if self.mode == "add" else None,
             )
 
             # ----------------------------------------------------------
@@ -382,10 +383,14 @@ class AMP_PPO:
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            # Update empirical normaliser with raw (pre-normalised) obs
-            self.discriminator.update_normalization(
-                disc_policy_batch.detach(), expert_batch.detach()
-            )
+            # Update normaliser: for ADD, only use policy diffs (not zeros) so
+            # DiffNorm tracks the true diff scale, not an average with zero.
+            if self.mode == "add":
+                self.discriminator.update_normalization(disc_policy_batch.detach())
+            else:
+                self.discriminator.update_normalization(
+                    disc_policy_batch.detach(), expert_batch.detach()
+                )
 
             # ----------------------------------------------------------
             # Statistics
