@@ -96,6 +96,21 @@ class OnPolicyRunner:
         self._disc_obs_buf = None
         self._disc_demo_obs_buf = None
 
+        # Optional live renderer (enabled when env.cfg.viz.render is True).
+        self.renderer = self._make_renderer()
+
+    def _make_renderer(self):
+        try:
+            viz_cfg = getattr(getattr(self.env, "cfg", None), "viz", None)
+            if viz_cfg is None or not getattr(viz_cfg, "render", False):
+                return None
+            base_env = getattr(self.env, "base_env", self.env)
+            from utils.render import Render
+            return Render(self.env.cfg, base_env.model)
+        except Exception as exc:
+            print(f"[OnPolicyRunner] Warning: could not initialise renderer: {exc}")
+            return None
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
@@ -173,6 +188,11 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs, critic_obs)
                     # Step environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+
+                    # Render
+                    if self.renderer is not None:
+                        base_env = getattr(self.env, "base_env", self.env)
+                        self.renderer.render(base_env.body_q, base_env.body_qd)
 
                     # Move to the agent device
                     obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)

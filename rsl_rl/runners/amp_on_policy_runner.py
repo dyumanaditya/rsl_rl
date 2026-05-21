@@ -163,6 +163,21 @@ class AMPOnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+        # Optional live renderer (enabled when env.cfg.viz.render is True).
+        self.renderer = self._make_renderer()
+
+    def _make_renderer(self):
+        try:
+            viz_cfg = getattr(getattr(self.env, "cfg", None), "viz", None)
+            if viz_cfg is None or not getattr(viz_cfg, "render", False):
+                return None
+            base_env = getattr(self.env, "base_env", self.env)
+            from utils.render import Render
+            return Render(self.env.cfg, base_env.model)
+        except Exception as exc:
+            print(f"[AMPOnPolicyRunner] Warning: could not initialise renderer: {exc}")
+            return None
+
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
@@ -226,6 +241,11 @@ class AMPOnPolicyRunner:
                     actions = self.alg.act(obs, critic_obs)
 
                     obs_raw, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+
+                    # Render
+                    if self.renderer is not None:
+                        base_env = getattr(self.env, "base_env", self.env)
+                        self.renderer.render(base_env.body_q, base_env.body_qd)
 
                     obs_raw = obs_raw.to(self.device)
                     rewards = rewards.to(self.device)
