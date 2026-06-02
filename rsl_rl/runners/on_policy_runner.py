@@ -16,6 +16,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.utils import store_code_state
+from utils.metric_logging import episode_tags, log_scalar_aliases
 
 
 class OnPolicyRunner:
@@ -366,11 +367,10 @@ class OnPolicyRunner:
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
                 # log to logger and terminal
+                log_scalar_aliases(self.writer, episode_tags(key), value, locs["it"])
                 if "/" in key:
-                    self.writer.add_scalar(key, value, locs["it"])
                     ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
                 else:
-                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
@@ -378,6 +378,7 @@ class OnPolicyRunner:
         # -- Losses
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
+        self.writer.add_scalar("Loss/policy", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/entropy", locs["mean_entropy"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         if self.alg.rnd:
@@ -390,23 +391,25 @@ class OnPolicyRunner:
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
+        self.writer.add_scalar("Perf/collection_time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
         # -- Training
         if len(locs["rewbuffer"]) > 0:
+            mean_reward = statistics.mean(locs["rewbuffer"])
+            mean_length = statistics.mean(locs["lenbuffer"])
             # separate logging for intrinsic and extrinsic rewards
             if self.alg.rnd:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # everything else
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_reward", mean_reward, locs["it"])
+            self.writer.add_scalar("Train/mean_episode_length", mean_length, locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
-                self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
+                self.writer.add_scalar("Train/mean_reward/time", mean_reward, self.tot_time)
                 self.writer.add_scalar(
-                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
+                    "Train/mean_episode_length/time", mean_length, self.tot_time
                 )
         # disc reward per-episode (primary training signal for AMP/ADD)
         if len(locs.get("disc_rewbuffer", [])) > 0:

@@ -44,7 +44,7 @@ class WandbSummaryWriter(SummaryWriter):
             "Train/mean_episode_length/time": "Train/mean_episode_length_time",
         }
 
-        wandb.log({"log_dir": run_name})
+        wandb.config.update({"log_dir": run_name}, allow_val_change=True)
 
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
         wandb.config.update({"runner_cfg": runner_cfg})

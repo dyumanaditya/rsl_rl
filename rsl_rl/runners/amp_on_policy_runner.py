@@ -31,6 +31,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.modules.discriminator import Discriminator
 from rsl_rl.utils import store_code_state
+from utils.metric_logging import episode_tags, log_scalar_aliases
 
 
 class AMPOnPolicyRunner:
@@ -220,9 +221,13 @@ class AMPOnPolicyRunner:
         rewbuffer: deque = deque(maxlen=100)
         lenbuffer: deque = deque(maxlen=100)
         disc_rewbuffer: deque = deque(maxlen=100)
+        task_rewbuffer: deque = deque(maxlen=100)
+        style_rewbuffer: deque = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_disc_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_task_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_style_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -311,15 +316,21 @@ class AMPOnPolicyRunner:
 
                         cur_reward_sum += blended_rewards
                         cur_disc_reward_sum += style_rewards
+                        cur_task_reward_sum += rewards
+                        cur_style_reward_sum += style_rewards
                         cur_episode_length += 1
 
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         disc_rewbuffer.extend(cur_disc_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        task_rewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        style_rewbuffer.extend(cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         cur_disc_reward_sum[new_ids] = 0
+                        cur_task_reward_sum[new_ids] = 0
+                        cur_style_reward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -388,11 +399,10 @@ class AMPOnPolicyRunner:
                         val = val.unsqueeze(0)
                     infotensor = torch.cat((infotensor, val.to(self.device)))
                 value = torch.mean(infotensor)
+                log_scalar_aliases(self.writer, episode_tags(key), value, locs["it"])
                 if "/" in key:
-                    self.writer.add_scalar(key, value, locs["it"])
                     ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
                 else:
-                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
         mean_std = self.alg.actor_critic.std.mean()
@@ -403,6 +413,7 @@ class AMPOnPolicyRunner:
 
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
+        self.writer.add_scalar("Loss/policy", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
         self.writer.add_scalar("Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"])
         self.writer.add_scalar("Loss/policy_pred", locs["mean_policy_pred"], locs["it"])
@@ -411,19 +422,25 @@ class AMPOnPolicyRunner:
         self.writer.add_scalar("Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
+        self.writer.add_scalar("Disc/loss", locs["mean_amp_loss"], locs["it"])
+        self.writer.add_scalar("Disc/grad_penalty_loss", locs["mean_grad_pen_loss"], locs["it"])
+        self.writer.add_scalar("Disc/agent_acc", locs["mean_accuracy_policy"], locs["it"])
+        self.writer.add_scalar("Disc/demo_acc", locs["mean_accuracy_expert"], locs["it"])
+        self.writer.add_scalar("Disc/policy_pred", locs["mean_policy_pred"], locs["it"])
+        self.writer.add_scalar("Disc/expert_pred", locs["mean_expert_pred"], locs["it"])
+        self.writer.add_scalar("Disc/mean_reward", locs["mean_style_reward_log"], locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection_time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learn_time", locs["learn_time"], locs["it"])
+        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
 
         if len(locs["rewbuffer"]) > 0:
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_style_reward", locs["mean_style_reward_log"], locs["it"])
-            self.writer.add_scalar("Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"])
-        if len(locs["disc_rewbuffer"]) > 0:
-            self.writer.add_scalar("Train/mean_disc_ep_reward", statistics.mean(locs["disc_rewbuffer"]), locs["it"])
-
+        if len(locs["task_rewbuffer"]) > 0:
+            self.writer.add_scalar("Train/mean_task_reward", statistics.mean(locs["task_rewbuffer"]), locs["it"])
+        if len(locs["style_rewbuffer"]) > 0:
+            self.writer.add_scalar("Train/mean_disc_reward", statistics.mean(locs["style_rewbuffer"]), locs["it"])
         str_ = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
         if len(locs["rewbuffer"]) > 0:
             log_string = (
