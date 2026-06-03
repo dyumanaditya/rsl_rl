@@ -237,12 +237,22 @@ class AMP_PPO:
             (value_loss, surrogate_loss, amp_loss, grad_pen_loss,
              policy_pred, expert_pred, acc_policy, acc_expert, kl)
         """
-        mean_value_loss = mean_surrogate_loss = 0.0
-        mean_amp_loss = mean_grad_pen_loss = 0.0
-        mean_policy_pred = mean_expert_pred = 0.0
+        # Per-minibatch statistics are accumulated on-device and read back with a
+        # single .item() after the loop. Calling .item() per minibatch forces a
+        # GPU->CPU sync each iteration (~8 syncs x total_updates), which serializes
+        # the optimizer and grows with env count; batching keeps the numbers
+        # identical while issuing one sync per scalar at the end.
+        dev = self.device
+        sum_value_loss = torch.zeros((), device=dev)
+        sum_surrogate_loss = torch.zeros((), device=dev)
+        sum_amp_loss = torch.zeros((), device=dev)
+        sum_grad_pen_loss = torch.zeros((), device=dev)
+        sum_policy_pred = torch.zeros((), device=dev)
+        sum_expert_pred = torch.zeros((), device=dev)
+        sum_acc_policy_num = torch.zeros((), device=dev)
+        sum_acc_expert_num = torch.zeros((), device=dev)
         mean_kl_divergence = 0.0
-        acc_policy_num = acc_expert_num = 0.0
-        acc_policy_den = acc_expert_den = 0.0
+        acc_policy_den = acc_expert_den = 0
 
         total_updates = self.num_learning_epochs * self.num_mini_batches
         disc_batch_size = (
@@ -399,31 +409,27 @@ class AMP_PPO:
                 policy_prob = torch.sigmoid(policy_d)
                 expert_prob = torch.sigmoid(expert_d)
 
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
-            mean_amp_loss += amp_loss.item()
-            mean_grad_pen_loss += grad_pen_loss.item()
-            mean_policy_pred += policy_prob.mean().item()
-            mean_expert_pred += expert_prob.mean().item()
+                sum_value_loss += value_loss.detach()
+                sum_surrogate_loss += surrogate_loss.detach()
+                sum_amp_loss += amp_loss.detach()
+                sum_grad_pen_loss += grad_pen_loss.detach()
+                sum_policy_pred += policy_prob.mean()
+                sum_expert_pred += expert_prob.mean()
+                sum_acc_policy_num += (torch.round(policy_prob) == 0).sum()
+                sum_acc_expert_num += (torch.round(expert_prob) == 1).sum()
+                acc_policy_den += policy_prob.numel()
+                acc_expert_den += expert_prob.numel()
 
-            acc_policy_num += (
-                (torch.round(policy_prob) == torch.zeros_like(policy_prob)).sum().item()
-            )
-            acc_expert_num += (
-                (torch.round(expert_prob) == torch.ones_like(expert_prob)).sum().item()
-            )
-            acc_policy_den += policy_prob.numel()
-            acc_expert_den += expert_prob.numel()
-
-        mean_value_loss /= total_updates
-        mean_surrogate_loss /= total_updates
-        mean_amp_loss /= total_updates
-        mean_grad_pen_loss /= total_updates
-        mean_policy_pred /= total_updates
-        mean_expert_pred /= total_updates
+        # Read the accumulated device-side statistics back to host in one shot.
+        mean_value_loss = sum_value_loss.item() / total_updates
+        mean_surrogate_loss = sum_surrogate_loss.item() / total_updates
+        mean_amp_loss = sum_amp_loss.item() / total_updates
+        mean_grad_pen_loss = sum_grad_pen_loss.item() / total_updates
+        mean_policy_pred = sum_policy_pred.item() / total_updates
+        mean_expert_pred = sum_expert_pred.item() / total_updates
         mean_kl_divergence /= total_updates
-        acc_policy = acc_policy_num / max(1, acc_policy_den)
-        acc_expert = acc_expert_num / max(1, acc_expert_den)
+        acc_policy = sum_acc_policy_num.item() / max(1, acc_policy_den)
+        acc_expert = sum_acc_expert_num.item() / max(1, acc_expert_den)
 
         self.storage.clear()
 
