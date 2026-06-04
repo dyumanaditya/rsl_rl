@@ -119,6 +119,11 @@ class AMP_PPO:
             },
         ]
         self.optimizer = optim.Adam(params, lr=learning_rate)
+        # Only the actor-critic group follows the adaptive-KL LR schedule. The
+        # discriminator groups must keep their fixed ``_disc_lr`` (mimickit trains
+        # the disc with an independent optimizer); letting the policy KL drive the
+        # disc LR over-trains the discriminator and starves the style reward.
+        self._policy_param_group = self.optimizer.param_groups[0]
 
         self.transition = RolloutStorage.Transition()
 
@@ -329,8 +334,9 @@ class AMP_PPO:
                     elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                         self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                    for pg in self.optimizer.param_groups:
-                        pg["lr"] = self.learning_rate
+                    # Update only the policy group's LR; leave the disc groups
+                    # pinned at their fixed _disc_lr (see __init__).
+                    self._policy_param_group["lr"] = self.learning_rate
 
             # ----------------------------------------------------------
             # PPO surrogate loss

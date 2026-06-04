@@ -88,6 +88,17 @@ class AMPOnPolicyRunner:
             num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
+        # Optionally freeze the action-noise std at its init value (MimicKit uses
+        # a FIXED std for AMP/ADD). Leaving it learnable with entropy_coef=0 and a
+        # low init collapses exploration and stalls imitation learning.
+        if getattr(im_cfg, "fixed_action_std", False):
+            if hasattr(actor_critic, "std") and isinstance(actor_critic.std, torch.nn.Parameter):
+                actor_critic.std.requires_grad_(False)
+                print(
+                    f"[AMPOnPolicyRunner] action std frozen at "
+                    f"{actor_critic.std.detach().mean().item():.4f} (fixed_action_std=True)."
+                )
+
         # ------------------------------------------------------------------
         # Discriminator
         # ------------------------------------------------------------------
