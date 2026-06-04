@@ -167,6 +167,48 @@ class AMPOnPolicyRunner:
         # Optional live renderer (enabled when env.cfg.viz.render is True).
         self.renderer = self._make_renderer()
 
+        # Optional periodic single-robot policy video logged to wandb.
+        self.video_recorder = None
+        self.video_interval = 0
+        self._maybe_init_video_recorder()
+
+    def _maybe_init_video_recorder(self):
+        viz_cfg = getattr(getattr(self.env, "cfg", None), "viz", None)
+        if viz_cfg is None or not getattr(viz_cfg, "record_policy_video", False):
+            return
+        if self.cfg.get("logger", "tensorboard").lower() != "wandb":
+            print("[AMPOnPolicyRunner] policy video requires the wandb logger; skipping.")
+            return
+        try:
+            from utils.policy_video import PolicyVideoRecorder
+            self.video_recorder = PolicyVideoRecorder(
+                self.env.cfg,
+                device=self.device,
+                writer=self.writer,
+                video_steps=getattr(viz_cfg, "video_steps", 600),
+                width=getattr(viz_cfg, "video_width", 1280),
+                height=getattr(viz_cfg, "video_height", 720),
+            )
+            self.video_interval = int(getattr(viz_cfg, "video_interval", 200))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[AMPOnPolicyRunner] Warning: could not init policy video recorder: {exc}")
+            self.video_recorder = None
+
+    def _record_policy_video(self, it: int):
+        if self.video_recorder is None or not self.video_recorder.enabled:
+            return
+        if self.video_interval <= 0 or it % self.video_interval != 0:
+            return
+        self.eval_mode()
+        try:
+            self.video_recorder.record(
+                it,
+                self.alg.actor_critic.act_inference,
+                obs_normalizer=self.obs_normalizer,
+            )
+        finally:
+            self.train_mode()
+
     def _make_renderer(self):
         try:
             viz_cfg = getattr(getattr(self.env, "cfg", None), "viz", None)
@@ -309,10 +351,16 @@ class AMPOnPolicyRunner:
 
                     # ---- Logging ----
                     if self.log_dir is not None:
+                        # Merge episode-end reward terms ("episode") and per-step
+                        # metrics ("log", e.g. imitation tracking error) so neither
+                        # channel is dropped when both are present on the same step.
+                        log_entry = {}
                         if "episode" in infos:
-                            ep_infos.append(infos["episode"])
-                        elif "log" in infos:
-                            ep_infos.append(infos["log"])
+                            log_entry.update(infos["episode"])
+                        if "log" in infos:
+                            log_entry.update(infos["log"])
+                        if log_entry:
+                            ep_infos.append(log_entry)
 
                         cur_reward_sum += blended_rewards
                         cur_disc_reward_sum += style_rewards
@@ -364,6 +412,7 @@ class AMPOnPolicyRunner:
                 self.log(locals())
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                self._record_policy_video(it)
 
             ep_infos.clear()
 
@@ -387,7 +436,11 @@ class AMPOnPolicyRunner:
 
         ep_string = ""
         if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
+            # Union of keys across all collected dicts: reward terms only appear on
+            # episode-end steps while tracking metrics appear every step, so keying
+            # off ep_infos[0] alone would drop one or the other.
+            keys = list({k: None for d in locs["ep_infos"] for k in d})
+            for key in keys:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
                     if key not in ep_info:
