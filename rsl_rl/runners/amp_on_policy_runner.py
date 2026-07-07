@@ -13,7 +13,8 @@
 #  - Discriminator rewards computed DURING the rollout (inside
 #    inference_mode) – the reward mixing happens before process_env_step,
 #    exactly as in amp-rsl-rl.
-#  - Combined PPO + discriminator backward pass via AMP_PPO.update().
+#  - AMP/ADD use a combined PPO + discriminator backward pass via AMP_PPO.update().
+#  - DeepMimic uses plain PPO on the env-provided tracking reward.
 
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
+from rsl_rl.algorithms import PPO
 from rsl_rl.algorithms.amp_ppo import AMP_PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
@@ -35,7 +37,7 @@ from utils.metric_logging import episode_tags, log_scalar_aliases
 
 
 class AMPOnPolicyRunner:
-    """On-policy runner for AMP / ADD imitation training.
+    """On-policy runner for imitation training.
 
     Mirrors the training loop of amp-rsl-rl's ``AMPOnPolicyRunner`` but
     works with the existing G1ImitationEnv interface:
@@ -56,6 +58,10 @@ class AMPOnPolicyRunner:
         ``hidden_dims``, ``empirical_normalization``.
         This dict is obtained by the runner from the ``base_env._im_cfg``
         object — the caller does not need to put it in ``train_cfg``.
+
+        ``mode="deepmimic"`` has no discriminator.  The env computes the
+        closed-form DeepMimic tracking reward and this runner trains regular
+        PPO on that reward while preserving the imitation logging/video hooks.
     """
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir=None, device="cpu"):
@@ -66,12 +72,16 @@ class AMPOnPolicyRunner:
         self.env = env
 
         # ------------------------------------------------------------------
-        # Resolve env-level AMP config
+        # Resolve env-level imitation config
         # ------------------------------------------------------------------
         base_env = getattr(env, "base_env", env)
         im_cfg = base_env._im_cfg
         self.im_cfg = im_cfg
-        disc_obs_size: int = base_env.disc_obs_size
+        self.imitation_mode = getattr(im_cfg, "mode", "none")
+        if self.imitation_mode not in ("amp", "add", "deepmimic"):
+            raise ValueError(f"Unknown imitation mode: {self.imitation_mode}")
+        self.has_discriminator = self.imitation_mode in ("amp", "add")
+        disc_obs_size: int = int(getattr(base_env, "disc_obs_size", 0))
 
         # ------------------------------------------------------------------
         # Observations
@@ -99,53 +109,81 @@ class AMPOnPolicyRunner:
                     f"{actor_critic.std.detach().mean().item():.4f} (fixed_action_std=True)."
                 )
 
-        # ------------------------------------------------------------------
-        # Discriminator
-        # ------------------------------------------------------------------
-        hidden_dims = getattr(im_cfg, "hidden_dims", [1024, 512])
-        empirical_norm = getattr(im_cfg, "empirical_normalization", False)
-        # ADD uses DiffNorm (scale by mean absolute diff); AMP uses standard norm.
-        disc_norm_kwargs = (
-            {"diff_normalization": True} if im_cfg.mode == "add"
-            else {"empirical_normalization": empirical_norm}
-        )
-        discriminator = Discriminator(
-            input_dim=disc_obs_size,
-            hidden_layer_sizes=hidden_dims,
-            reward_scale=im_cfg.disc_reward_scale,
-            device=self.device,
-            **disc_norm_kwargs,
-        ).to(self.device)
+        if self.has_discriminator:
+            if disc_obs_size <= 0:
+                raise RuntimeError(
+                    f"Imitation mode {self.imitation_mode!r} requires discriminator observations, "
+                    "but base_env.disc_obs_size is zero."
+                )
 
-        # ------------------------------------------------------------------
-        # Demo function
-        # ------------------------------------------------------------------
-        if im_cfg.mode == "amp":
-            demo_fn = lambda n: base_env.fetch_disc_obs_demo(n).to(self.device)  # noqa: E731
-        elif im_cfg.mode == "add":
-            demo_fn = lambda n: torch.zeros(n, disc_obs_size, device=self.device)  # noqa: E731
+            # ------------------------------------------------------------------
+            # Discriminator
+            # ------------------------------------------------------------------
+            hidden_dims = getattr(im_cfg, "hidden_dims", [1024, 512])
+            empirical_norm = getattr(im_cfg, "empirical_normalization", False)
+            # ADD uses DiffNorm (scale by mean absolute diff); AMP uses standard norm.
+            disc_norm_kwargs = (
+                {"diff_normalization": True} if im_cfg.mode == "add"
+                else {"empirical_normalization": empirical_norm}
+            )
+            discriminator = Discriminator(
+                input_dim=disc_obs_size,
+                hidden_layer_sizes=hidden_dims,
+                reward_scale=im_cfg.disc_reward_scale,
+                device=self.device,
+                **disc_norm_kwargs,
+            ).to(self.device)
+
+            # ------------------------------------------------------------------
+            # Demo function
+            # ------------------------------------------------------------------
+            if im_cfg.mode == "amp":
+                demo_fn = lambda n: base_env.fetch_disc_obs_demo(n).to(self.device)  # noqa: E731
+            else:
+                demo_fn = lambda n: torch.zeros(n, disc_obs_size, device=self.device)  # noqa: E731
+
+            # ------------------------------------------------------------------
+            # AMP_PPO algorithm
+            # ------------------------------------------------------------------
+            # Strip keys that PPO supports but AMP_PPO does not.
+            _amp_ppo_params = set(AMP_PPO.__init__.__code__.co_varnames)
+            alg_kwargs = {k: v for k, v in self.alg_cfg.items() if k in _amp_ppo_params}
+            alg_kwargs.pop("class_name", None)
+
+            self.alg: AMP_PPO | PPO = AMP_PPO(
+                actor_critic=actor_critic,
+                discriminator=discriminator,
+                demo_fn=demo_fn,
+                mode=im_cfg.mode,
+                disc_lr=getattr(im_cfg, "disc_lr", None),
+                amp_replay_buffer_size=getattr(im_cfg, "disc_buffer_size", 100_000),
+                grad_penalty_coeff=getattr(im_cfg, "disc_grad_penalty", 10.0),
+                device=self.device,
+                **alg_kwargs,
+            )
         else:
-            raise ValueError(f"Unknown imitation mode: {im_cfg.mode}")
+            # DeepMimic has no discriminator.  The env replaces the task reward
+            # with its closed-form tracking reward, so train normal PPO on it.
+            if self.alg_cfg.get("rnd_cfg") is not None:
+                rnd_state = extras["observations"].get("rnd_state")
+                if rnd_state is None:
+                    raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
+                self.alg_cfg["rnd_cfg"]["num_state"] = rnd_state.shape[1]
+                dt = getattr(env, "dt", None)
+                if dt is None and hasattr(base_env, "get_timestep"):
+                    dt = base_env.get_timestep()
+                if dt is None:
+                    dt = getattr(getattr(getattr(env, "cfg", None), "sim", None), "dt", 1.0)
+                self.alg_cfg["rnd_cfg"]["weight"] *= dt
+            if self.alg_cfg.get("symmetry_cfg") is not None:
+                self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # ------------------------------------------------------------------
-        # AMP_PPO algorithm
-        # ------------------------------------------------------------------
-        # Strip keys that PPO supports but AMP_PPO does not.
-        _amp_ppo_params = set(AMP_PPO.__init__.__code__.co_varnames)
-        alg_kwargs = {k: v for k, v in self.alg_cfg.items() if k in _amp_ppo_params}
-        alg_kwargs.pop("class_name", None)
-
-        self.alg: AMP_PPO = AMP_PPO(
-            actor_critic=actor_critic,
-            discriminator=discriminator,
-            demo_fn=demo_fn,
-            mode=im_cfg.mode,
-            disc_lr=getattr(im_cfg, "disc_lr", None),
-            amp_replay_buffer_size=getattr(im_cfg, "disc_buffer_size", 100_000),
-            grad_penalty_coeff=getattr(im_cfg, "disc_grad_penalty", 10.0),
-            device=self.device,
-            **alg_kwargs,
-        )
+            alg_class = eval(self.alg_cfg.get("class_name", "PPO"))
+            _ppo_params = set(alg_class.__init__.__code__.co_varnames)
+            alg_kwargs = {k: v for k, v in self.alg_cfg.items() if k in _ppo_params}
+            alg_kwargs.pop("class_name", None)
+            self.alg: AMP_PPO | PPO = alg_class(actor_critic, device=self.device, **alg_kwargs)
+            print("[AMPOnPolicyRunner] DeepMimic tracking reward enabled (no discriminator).")
 
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.save_interval: int = self.cfg["save_interval"]
@@ -263,10 +301,12 @@ class AMPOnPolicyRunner:
 
         # Initial disc obs – sourced directly from the env state (before any step)
         base_env = getattr(self.env, "base_env", self.env)
-        disc_obs = base_env.disc_obs.clone().to(self.device)
+        disc_obs: torch.Tensor | None = None
         demo_disc_obs: torch.Tensor | None = None
-        if self.im_cfg.mode == "add":
-            demo_disc_obs = base_env._disc_obs_demo.clone().to(self.device)
+        if self.has_discriminator:
+            disc_obs = base_env.disc_obs.clone().to(self.device)
+            if self.im_cfg.mode == "add":
+                demo_disc_obs = base_env._disc_obs_demo.clone().to(self.device)
 
         self.train_mode()
 
@@ -317,48 +357,55 @@ class AMPOnPolicyRunner:
                     else:
                         critic_obs = obs
 
-                    # Disc obs for this transition (captured pre-reset by env)
-                    next_disc_obs = infos.get("disc_obs")
-                    if next_disc_obs is not None:
-                        next_disc_obs = next_disc_obs.to(self.device)
-                    else:
-                        next_disc_obs = disc_obs  # fallback (shouldn't happen in imitation env)
-
-                    next_demo_disc_obs: torch.Tensor | None = None
-                    if self.im_cfg.mode == "add":
-                        next_demo_disc_obs = infos.get("disc_obs_demo")
-                        if next_demo_disc_obs is not None:
-                            next_demo_disc_obs = next_demo_disc_obs.to(self.device)
+                    if self.has_discriminator:
+                        # Disc obs for this transition (captured pre-reset by env)
+                        next_disc_obs = infos.get("disc_obs")
+                        if next_disc_obs is not None:
+                            next_disc_obs = next_disc_obs.to(self.device)
                         else:
-                            next_demo_disc_obs = demo_disc_obs
+                            next_disc_obs = disc_obs  # fallback (shouldn't happen in imitation env)
 
-                    # ---- Style reward (computed inside inference_mode) ----
-                    if self.im_cfg.mode == "add":
-                        # ADD: discriminator takes diff = demo - agent
-                        diff = next_demo_disc_obs - next_disc_obs
-                        style_rewards = self.alg.discriminator.predict_reward(diff)
+                        next_demo_disc_obs: torch.Tensor | None = None
+                        if self.im_cfg.mode == "add":
+                            next_demo_disc_obs = infos.get("disc_obs_demo")
+                            if next_demo_disc_obs is not None:
+                                next_demo_disc_obs = next_demo_disc_obs.to(self.device)
+                            else:
+                                next_demo_disc_obs = demo_disc_obs
+
+                        # ---- Style reward (computed inside inference_mode) ----
+                        if self.im_cfg.mode == "add":
+                            # ADD: discriminator takes diff = demo - agent
+                            diff = next_demo_disc_obs - next_disc_obs
+                            style_rewards = self.alg.discriminator.predict_reward(diff)
+                        else:
+                            # AMP: discriminator takes agent disc_obs directly
+                            style_rewards = self.alg.discriminator.predict_reward(next_disc_obs)
+
+                        mean_task_reward_log += rewards.mean().item()
+                        mean_style_reward_log += style_rewards.mean().item()
+
+                        # Mix task + style rewards (copy amp-rsl-rl 0.5/0.5 default
+                        # but respect im_cfg weights if provided)
+                        task_w = getattr(self.im_cfg, "task_reward_weight", 0.5)
+                        disc_w = getattr(self.im_cfg, "disc_reward_weight", 0.5)
+                        blended_rewards = task_w * rewards + disc_w * style_rewards
+
+                        self.alg.process_env_step(blended_rewards, dones, infos)
+
+                        # Insert into disc replay buffer
+                        self.alg.process_disc_step(next_disc_obs, next_demo_disc_obs)
+
+                        # Advance disc obs
+                        disc_obs = next_disc_obs
+                        if self.im_cfg.mode == "add":
+                            demo_disc_obs = next_demo_disc_obs
                     else:
-                        # AMP: discriminator takes agent disc_obs directly
-                        style_rewards = self.alg.discriminator.predict_reward(next_disc_obs)
-
-                    mean_task_reward_log += rewards.mean().item()
-                    mean_style_reward_log += style_rewards.mean().item()
-
-                    # Mix task + style rewards (copy amp-rsl-rl 0.5/0.5 default
-                    # but respect im_cfg weights if provided)
-                    task_w = getattr(self.im_cfg, "task_reward_weight", 0.5)
-                    disc_w = getattr(self.im_cfg, "disc_reward_weight", 0.5)
-                    blended_rewards = task_w * rewards + disc_w * style_rewards
-
-                    self.alg.process_env_step(blended_rewards, dones, infos)
-
-                    # Insert into disc replay buffer
-                    self.alg.process_disc_step(next_disc_obs, next_demo_disc_obs)
-
-                    # Advance disc obs
-                    disc_obs = next_disc_obs
-                    if self.im_cfg.mode == "add":
-                        demo_disc_obs = next_demo_disc_obs
+                        # DeepMimic: env.step() already returns the tracking reward.
+                        style_rewards = torch.zeros_like(rewards)
+                        blended_rewards = rewards
+                        mean_task_reward_log += rewards.mean().item()
+                        self.alg.process_env_step(blended_rewards, dones, infos)
 
                     # ---- Logging ----
                     if self.log_dir is not None:
@@ -376,15 +423,18 @@ class AMPOnPolicyRunner:
                         cur_reward_sum += blended_rewards
                         cur_disc_reward_sum += style_rewards
                         cur_task_reward_sum += rewards
-                        cur_style_reward_sum += style_rewards
+                        if self.has_discriminator:
+                            cur_style_reward_sum += style_rewards
                         cur_episode_length += 1
 
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        disc_rewbuffer.extend(cur_disc_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        if self.has_discriminator:
+                            disc_rewbuffer.extend(cur_disc_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         task_rewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        style_rewbuffer.extend(cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        if self.has_discriminator:
+                            style_rewbuffer.extend(cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         cur_disc_reward_sum[new_ids] = 0
@@ -403,17 +453,36 @@ class AMPOnPolicyRunner:
             # ----------------------------------------------------------
             # Combined PPO + discriminator update
             # ----------------------------------------------------------
-            (
-                mean_value_loss,
-                mean_surrogate_loss,
-                mean_amp_loss,
-                mean_grad_pen_loss,
-                mean_policy_pred,
-                mean_expert_pred,
-                mean_accuracy_policy,
-                mean_accuracy_expert,
-                mean_kl_divergence,
-            ) = self.alg.update()
+            if self.has_discriminator:
+                (
+                    mean_value_loss,
+                    mean_surrogate_loss,
+                    mean_amp_loss,
+                    mean_grad_pen_loss,
+                    mean_policy_pred,
+                    mean_expert_pred,
+                    mean_accuracy_policy,
+                    mean_accuracy_expert,
+                    mean_kl_divergence,
+                ) = self.alg.update()
+                mean_entropy = None
+                mean_rnd_loss = None
+                mean_symmetry_loss = None
+            else:
+                (
+                    mean_value_loss,
+                    mean_surrogate_loss,
+                    mean_entropy,
+                    mean_rnd_loss,
+                    mean_symmetry_loss,
+                ) = self.alg.update()
+                mean_amp_loss = 0.0
+                mean_grad_pen_loss = 0.0
+                mean_policy_pred = 0.0
+                mean_expert_pred = 0.0
+                mean_accuracy_policy = 0.0
+                mean_accuracy_expert = 0.0
+                mean_kl_divergence = 0.0
 
             stop = time.time()
             learn_time = stop - start
@@ -478,21 +547,29 @@ class AMPOnPolicyRunner:
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/policy", locs["mean_surrogate_loss"], locs["it"])
-        self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
-        self.writer.add_scalar("Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"])
-        self.writer.add_scalar("Loss/policy_pred", locs["mean_policy_pred"], locs["it"])
-        self.writer.add_scalar("Loss/expert_pred", locs["mean_expert_pred"], locs["it"])
-        self.writer.add_scalar("Loss/accuracy_policy", locs["mean_accuracy_policy"], locs["it"])
-        self.writer.add_scalar("Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
-        self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
-        self.writer.add_scalar("Disc/loss", locs["mean_amp_loss"], locs["it"])
-        self.writer.add_scalar("Disc/grad_penalty_loss", locs["mean_grad_pen_loss"], locs["it"])
-        self.writer.add_scalar("Disc/agent_acc", locs["mean_accuracy_policy"], locs["it"])
-        self.writer.add_scalar("Disc/demo_acc", locs["mean_accuracy_expert"], locs["it"])
-        self.writer.add_scalar("Disc/policy_pred", locs["mean_policy_pred"], locs["it"])
-        self.writer.add_scalar("Disc/expert_pred", locs["mean_expert_pred"], locs["it"])
-        self.writer.add_scalar("Disc/mean_reward", locs["mean_style_reward_log"], locs["it"])
+        if self.has_discriminator:
+            self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
+            self.writer.add_scalar("Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"])
+            self.writer.add_scalar("Loss/policy_pred", locs["mean_policy_pred"], locs["it"])
+            self.writer.add_scalar("Loss/expert_pred", locs["mean_expert_pred"], locs["it"])
+            self.writer.add_scalar("Loss/accuracy_policy", locs["mean_accuracy_policy"], locs["it"])
+            self.writer.add_scalar("Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"])
+            self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
+            self.writer.add_scalar("Disc/loss", locs["mean_amp_loss"], locs["it"])
+            self.writer.add_scalar("Disc/grad_penalty_loss", locs["mean_grad_pen_loss"], locs["it"])
+            self.writer.add_scalar("Disc/agent_acc", locs["mean_accuracy_policy"], locs["it"])
+            self.writer.add_scalar("Disc/demo_acc", locs["mean_accuracy_expert"], locs["it"])
+            self.writer.add_scalar("Disc/policy_pred", locs["mean_policy_pred"], locs["it"])
+            self.writer.add_scalar("Disc/expert_pred", locs["mean_expert_pred"], locs["it"])
+            self.writer.add_scalar("Disc/mean_reward", locs["mean_style_reward_log"], locs["it"])
+        else:
+            if locs["mean_entropy"] is not None:
+                self.writer.add_scalar("Loss/entropy", locs["mean_entropy"], locs["it"])
+            if locs["mean_rnd_loss"] is not None:
+                self.writer.add_scalar("Loss/rnd", locs["mean_rnd_loss"], locs["it"])
+            if locs["mean_symmetry_loss"] is not None:
+                self.writer.add_scalar("Loss/symmetry", locs["mean_symmetry_loss"], locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection_time", locs["collection_time"], locs["it"])
@@ -506,37 +583,32 @@ class AMPOnPolicyRunner:
         if len(locs["style_rewbuffer"]) > 0:
             self.writer.add_scalar("Train/mean_disc_reward", statistics.mean(locs["style_rewbuffer"]), locs["it"])
         str_ = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-        if len(locs["rewbuffer"]) > 0:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str_.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s"""
-                f""" (collection: {locs['collection_time']:.3f}s,"""
-                f""" learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+        log_string = (
+            f"""{'#' * width}\n"""
+            f"""{str_.center(width, ' ')}\n\n"""
+            f"""{'Computation:':>{pad}} {fps:.0f} steps/s"""
+            f""" (collection: {locs['collection_time']:.3f}s,"""
+            f""" learning {locs['learn_time']:.3f}s)\n"""
+            f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+            f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+        )
+        if self.has_discriminator:
+            log_string += (
                 f"""{'AMP loss:':>{pad}} {locs['mean_amp_loss']:.4f}\n"""
                 f"""{'Grad pen loss:':>{pad}} {locs['mean_grad_pen_loss']:.4f}\n"""
                 f"""{'Policy / expert pred:':>{pad}} {locs['mean_policy_pred']:.3f} / {locs['mean_expert_pred']:.3f}\n"""
                 f"""{'Disc acc (pol / exp):':>{pad}} {locs['mean_accuracy_policy']:.3f} / {locs['mean_accuracy_expert']:.3f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-                f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
-                f"""{'Mean style reward:':>{pad}} {locs['mean_style_reward_log']:.4f}\n"""
+            )
+        elif locs["mean_entropy"] is not None:
+            log_string += f"""{'Entropy:':>{pad}} {locs['mean_entropy']:.4f}\n"""
+        log_string += f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+        if len(locs["rewbuffer"]) > 0:
+            log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+            if self.has_discriminator:
+                log_string += f"""{'Mean style reward:':>{pad}} {locs['mean_style_reward_log']:.4f}\n"""
+            log_string += (
                 f"""{'Mean task reward:':>{pad}} {locs['mean_task_reward_log']:.4f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
-            )
-        else:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str_.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s"""
-                f""" (collection: {locs['collection_time']:.3f}s,"""
-                f""" learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'AMP loss:':>{pad}} {locs['mean_amp_loss']:.4f}\n"""
-                f"""{'Grad pen loss:':>{pad}} {locs['mean_grad_pen_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
 
         log_string += ep_string
@@ -562,10 +634,11 @@ class AMPOnPolicyRunner:
         saved_dict = {
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "discriminator_state_dict": self.alg.discriminator.state_dict(),
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        if self.has_discriminator:
+            saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
@@ -576,7 +649,7 @@ class AMPOnPolicyRunner:
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False, map_location=self.device)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
-        if "discriminator_state_dict" in loaded_dict:
+        if self.has_discriminator and "discriminator_state_dict" in loaded_dict:
             self.alg.discriminator.load_state_dict(
                 loaded_dict["discriminator_state_dict"], strict=False
             )
@@ -601,14 +674,16 @@ class AMPOnPolicyRunner:
 
     def train_mode(self):
         self.alg.actor_critic.train()
-        self.alg.discriminator.train()
+        if self.has_discriminator:
+            self.alg.discriminator.train()
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.critic_obs_normalizer.train()
 
     def eval_mode(self):
         self.alg.actor_critic.eval()
-        self.alg.discriminator.eval()
+        if self.has_discriminator:
+            self.alg.discriminator.eval()
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.critic_obs_normalizer.eval()
