@@ -33,6 +33,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.modules.discriminator import Discriminator
 from rsl_rl.utils import store_code_state
+from utils.contact_force_logging import pop_contact_force_stats
 from utils.metric_logging import episode_tags, log_scalar_aliases
 
 
@@ -574,6 +575,12 @@ class AMPOnPolicyRunner:
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection_time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
+        # Per-leg contact forces over this iteration's rollout. Flushes the
+        # substep records the sim accumulated; see utils/contact_force_logging.py
+        # for how to read them when tuning cfg.sim.bundle_contact_force_thresh.
+        for tag, value in pop_contact_force_stats(self.env).items():
+            self.writer.add_scalar(tag, value, locs["it"])
 
         if len(locs["rewbuffer"]) > 0:
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
