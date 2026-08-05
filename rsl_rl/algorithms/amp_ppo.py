@@ -215,11 +215,18 @@ class AMP_PPO:
         ADD mode: inserts the *difference* ``demo_disc_obs - disc_obs`` so
             that the replay buffer always stores the same quantity the
             discriminator is trained on (actual diff = negative class).
+
+        With external root tracking the stored differential is REDUCED (global
+        root pos/rot dropped) so the classifier gets no root signal at all —
+        root tracking is the aux reward's job. ``discriminator.reduce`` is a
+        no-op otherwise, and the buffer is sized to ``discriminator.input_dim``,
+        which already reports the reduced width. Mirrors the SHAC
+        ``ADDDiscriminator._update_js`` reduce-then-push order.
         """
         if self.mode == "add" and demo_disc_obs is not None:
-            entry = (demo_disc_obs - disc_obs).detach()
+            entry = self.discriminator.reduce((demo_disc_obs - disc_obs).detach())
         else:
-            entry = disc_obs.detach()
+            entry = self.discriminator.reduce(disc_obs.detach())
         self.amp_storage.insert(entry)
 
     def compute_returns(self, last_critic_obs: torch.Tensor) -> None:

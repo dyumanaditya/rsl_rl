@@ -82,6 +82,8 @@ class AMPOnPolicyRunner:
         if self.imitation_mode not in ("amp", "add", "deepmimic"):
             raise ValueError(f"Unknown imitation mode: {self.imitation_mode}")
         self.has_discriminator = self.imitation_mode in ("amp", "add")
+        # Set below when the ADD discriminator has external root tracking on.
+        self.aux_root = False
         disc_obs_size: int = int(getattr(base_env, "disc_obs_size", 0))
 
         # ------------------------------------------------------------------
@@ -127,21 +129,50 @@ class AMPOnPolicyRunner:
                 {"diff_normalization": True} if im_cfg.mode == "add"
                 else {"empirical_normalization": empirical_norm}
             )
+            # External root tracking (imitation.use_aux_root_tracking): resolve the
+            # same ADD config FoRL-SHAC uses and hand the discriminator the
+            # per-feature-group slices so it can split the global root out of the
+            # adversarial differential and reward it separately. AMP has no aux root
+            # term, so it is only wired for ADD.
+            add_cfg = None
+            disc_feature_groups = None
+            if im_cfg.mode == "add":
+                from imitation.wadd import resolve_add_cfg
+                add_cfg = resolve_add_cfg(im_cfg)
+                disc_feature_groups = getattr(base_env, "disc_feature_groups", None)
+                if getattr(add_cfg, "use_aux_root_tracking", False) and not disc_feature_groups:
+                    raise RuntimeError(
+                        "imitation.use_aux_root_tracking is on but the env exposes no "
+                        "disc_feature_groups; cannot locate the global root slots."
+                    )
             discriminator = Discriminator(
                 input_dim=disc_obs_size,
                 hidden_layer_sizes=hidden_dims,
                 reward_scale=im_cfg.disc_reward_scale,
                 device=self.device,
+                feature_groups=disc_feature_groups,
+                add_cfg=add_cfg,
                 **disc_norm_kwargs,
             ).to(self.device)
+            self.aux_root = bool(getattr(discriminator, "aux_root", False))
+            if self.aux_root:
+                print(
+                    f"[AMPOnPolicyRunner] external root tracking ON: disc differential "
+                    f"{disc_obs_size} -> {discriminator.input_dim} dims (global root removed); "
+                    f"aux root reward pos_w={add_cfg.aux_root_weight} ori_w={add_cfg.aux_root_ori_weight} "
+                    f"kind={add_cfg.aux_root_reward_kind}."
+                )
 
             # ------------------------------------------------------------------
             # Demo function
             # ------------------------------------------------------------------
+            # ADD's positive class is the zero vector at the width the classifier
+            # actually sees, i.e. the REDUCED width under external root tracking.
+            disc_input_dim = discriminator.input_dim
             if im_cfg.mode == "amp":
                 demo_fn = lambda n: base_env.fetch_disc_obs_demo(n).to(self.device)  # noqa: E731
             else:
-                demo_fn = lambda n: torch.zeros(n, disc_obs_size, device=self.device)  # noqa: E731
+                demo_fn = lambda n: torch.zeros(n, disc_input_dim, device=self.device)  # noqa: E731
 
             # ------------------------------------------------------------------
             # AMP_PPO algorithm
@@ -331,11 +362,21 @@ class AMPOnPolicyRunner:
 
             mean_style_reward_log = 0.0
             mean_task_reward_log = 0.0
+            mean_aux_root_log = 0.0
+            mean_aux_root_pos_log = 0.0
+            mean_aux_root_ori_log = 0.0
 
             # ----------------------------------------------------------
             # Rollout (mirrors amp-rsl-rl learn() inner loop)
             # ----------------------------------------------------------
             with torch.inference_mode():
+                # External-root-tracking stats accumulate ON DEVICE and are read
+                # back with a single .item() after the rollout: a per-step .item()
+                # would add three GPU->CPU syncs per step to the hot loop.
+                aux_sums = (
+                    [torch.zeros((), device=self.device) for _ in range(3)]
+                    if self.aux_root else None
+                )
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
 
@@ -375,6 +416,8 @@ class AMPOnPolicyRunner:
                                 next_demo_disc_obs = demo_disc_obs
 
                         # ---- Style reward (computed inside inference_mode) ----
+                        # NOTE: with external root tracking this is style + aux_root
+                        # (predict_reward returns the sum, matching SHAC's disc_r).
                         if self.im_cfg.mode == "add":
                             # ADD: discriminator takes diff = demo - agent
                             diff = next_demo_disc_obs - next_disc_obs
@@ -382,6 +425,14 @@ class AMPOnPolicyRunner:
                         else:
                             # AMP: discriminator takes agent disc_obs directly
                             style_rewards = self.alg.discriminator.predict_reward(next_disc_obs)
+
+                        if aux_sums is not None:
+                            disc = self.alg.discriminator
+                            for i, part in enumerate(
+                                (disc.last_aux_total, disc.last_aux_pos, disc.last_aux_ori)
+                            ):
+                                if part is not None:
+                                    aux_sums[i] += part.mean()
 
                         mean_task_reward_log += rewards.mean().item()
                         mean_style_reward_log += style_rewards.mean().item()
@@ -450,6 +501,10 @@ class AMPOnPolicyRunner:
 
             mean_style_reward_log /= self.num_steps_per_env
             mean_task_reward_log /= self.num_steps_per_env
+            if aux_sums is not None:
+                mean_aux_root_log = aux_sums[0].item() / self.num_steps_per_env
+                mean_aux_root_pos_log = aux_sums[1].item() / self.num_steps_per_env
+                mean_aux_root_ori_log = aux_sums[2].item() / self.num_steps_per_env
 
             # ----------------------------------------------------------
             # Combined PPO + discriminator update
@@ -564,6 +619,18 @@ class AMPOnPolicyRunner:
             self.writer.add_scalar("Disc/policy_pred", locs["mean_policy_pred"], locs["it"])
             self.writer.add_scalar("Disc/expert_pred", locs["mean_expert_pred"], locs["it"])
             self.writer.add_scalar("Disc/mean_reward", locs["mean_style_reward_log"], locs["it"])
+            if self.aux_root:
+                # Split the (otherwise combined) disc reward into style vs the
+                # external global-root aux so their balance is visible. Same keys
+                # and same definition as forl/algorithms/shac.py, so a SHAC run and
+                # a PPO run are directly comparable in wandb.
+                aux = locs["mean_aux_root_log"]
+                total = locs["mean_style_reward_log"]
+                self.writer.add_scalar("Disc/aux_root_reward", aux, locs["it"])
+                self.writer.add_scalar("Disc/aux_root_pos_reward", locs["mean_aux_root_pos_log"], locs["it"])
+                self.writer.add_scalar("Disc/aux_root_ori_reward", locs["mean_aux_root_ori_log"], locs["it"])
+                self.writer.add_scalar("Disc/style_reward", total - aux, locs["it"])
+                self.writer.add_scalar("Disc/aux_root_fraction", aux / max(abs(total), 1e-6), locs["it"])
         else:
             if locs["mean_entropy"] is not None:
                 self.writer.add_scalar("Loss/entropy", locs["mean_entropy"], locs["it"])
@@ -613,6 +680,11 @@ class AMPOnPolicyRunner:
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             if self.has_discriminator:
                 log_string += f"""{'Mean style reward:':>{pad}} {locs['mean_style_reward_log']:.4f}\n"""
+                if self.aux_root:
+                    log_string += (
+                        f"""{'  of which aux-root (pos/ori):':>{pad}} {locs['mean_aux_root_log']:.4f}"""
+                        f""" ({locs['mean_aux_root_pos_log']:.4f} / {locs['mean_aux_root_ori_log']:.4f})\n"""
+                    )
             log_string += (
                 f"""{'Mean task reward:':>{pad}} {locs['mean_task_reward_log']:.4f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
