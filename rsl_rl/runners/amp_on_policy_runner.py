@@ -190,8 +190,25 @@ class AMPOnPolicyRunner:
                 disc_lr=getattr(im_cfg, "disc_lr", None),
                 amp_replay_buffer_size=getattr(im_cfg, "disc_buffer_size", 100_000),
                 grad_penalty_coeff=getattr(im_cfg, "disc_grad_penalty", 10.0),
+                # MimicKit disc schedule — the same three keys FoRL-SHAC reads.
+                disc_epochs=getattr(im_cfg, "disc_epochs", 2),
+                disc_batch_size=getattr(im_cfg, "disc_batch_size", 2),
+                disc_replay_samples=getattr(im_cfg, "disc_replay_samples", 1000),
                 device=self.device,
                 **alg_kwargs,
+            )
+            # self.num_steps_per_env is assigned further down in __init__, so read
+            # the rollout length straight from the config here.
+            _T = int(self.cfg["num_steps_per_env"])
+            _dbatch = max(1, int(self.alg.disc_batch_size * self.env.num_envs))
+            _dsteps = max(1, -(-_T * self.env.num_envs // _dbatch)) * max(
+                1, self.alg.disc_epochs
+            )
+            print(
+                f"[AMPOnPolicyRunner] disc schedule (MimicKit): {_dsteps} steps x "
+                f"batch {_dbatch} (disc_epochs={self.alg.disc_epochs}, "
+                f"disc_batch_size={self.alg.disc_batch_size}/env, "
+                f"disc_replay_samples={self.alg.disc_replay_samples})."
             )
         else:
             # DeepMimic has no discriminator.  The env replaces the task reward
@@ -718,6 +735,10 @@ class AMPOnPolicyRunner:
         }
         if self.has_discriminator:
             saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
+            # The discriminator has its own optimizer (MimicKit-style separate
+            # disc update); it used to share `optimizer`, so checkpoints written
+            # before that split carry no such entry — load() tolerates its absence.
+            saved_dict["disc_optimizer_state_dict"] = self.alg.disc_optimizer.state_dict()
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
@@ -736,7 +757,24 @@ class AMPOnPolicyRunner:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
             self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
         if load_optimizer:
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # Checkpoints written before the policy/discriminator optimizer split
+            # hold one Adam with three param groups (actor-critic + disc trunk +
+            # disc head); the current `optimizer` has only the actor-critic group,
+            # so loading them raises. The weights above are already restored, so
+            # fall back to fresh optimizer state rather than failing the resume.
+            try:
+                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            except ValueError as exc:
+                print(
+                    f"[AMPOnPolicyRunner] ignoring incompatible optimizer state in "
+                    f"{path} ({exc}); resuming with fresh optimizer state. This is "
+                    "expected for checkpoints predating the separate discriminator "
+                    "optimizer."
+                )
+            if self.has_discriminator and "disc_optimizer_state_dict" in loaded_dict:
+                self.alg.disc_optimizer.load_state_dict(
+                    loaded_dict["disc_optimizer_state_dict"]
+                )
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict.get("infos")
 

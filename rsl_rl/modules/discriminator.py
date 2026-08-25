@@ -302,7 +302,16 @@ class Discriminator(nn.Module):
         """R1 gradient penalty evaluated on the expert (real) data.
 
         Matches the BCEWithLogits branch of amp-rsl-rl's compute_grad_pen.
+
+        Prefer ``compute_loss_fused`` in the training loop: this entry point runs
+        its OWN forward through the trunk, so calling it once per class (the ADD
+        two-sided penalty) costs two extra discriminator forwards on top of the
+        one already used for the logits.
         """
+        if lambda_ <= 0.0:
+            # The penalty is scaled to zero — skip the (expensive) double-backward
+            # graph entirely instead of building it and multiplying by 0.
+            return expert_obs.new_zeros(())
         data = self.obs_normalizer(expert_obs.detach()).requires_grad_(True)
         scores = self.linear(self.trunk(data))
         grad = autograd.grad(
@@ -313,6 +322,80 @@ class Discriminator(nn.Module):
             only_inputs=True,
         )[0]
         return 0.5 * lambda_ * grad.pow(2).sum(dim=1).mean()
+
+    def compute_loss_fused(
+        self,
+        combined_obs: torch.Tensor,
+        num_policy: int,
+        lambda_: float = 10.0,
+        two_sided: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One-forward version of ``forward`` + ``compute_loss``.
+
+        The unfused path runs the trunk THREE times per minibatch: once for the
+        logits, then once inside each ``compute_grad_pen`` call (expert, and for
+        ADD also policy). The R1 penalty only needs d(score)/d(normalised input),
+        which is available from the SAME graph as the logits, so a single forward
+        plus a single ``autograd.grad`` reproduces every term exactly.
+
+        Args:
+            combined_obs: ``cat([policy_obs, expert_obs], dim=0)`` — the reduced
+                disc observations, already detached (they come from storage).
+            num_policy: number of leading rows belonging to the policy class.
+            lambda_: R1 penalty coefficient. ``<= 0`` skips the penalty graph.
+            two_sided: also penalise at the policy samples (MimicKit ADD).
+
+        Returns:
+            ``(amp_loss, grad_pen, policy_d, expert_d)`` — numerically identical
+            to ``forward`` + ``compute_loss`` on the same inputs.
+        """
+        need_gp = lambda_ > 0.0
+
+        # EmpiricalNormalization.forward UPDATES its running statistics, so the
+        # unfused path (which normalises once per forward, i.e. 3x per minibatch)
+        # advances those stats differently than a single fused call. Fusing would
+        # then silently change AMP's normalisation schedule, so fall back to the
+        # legacy path there. ADD's DiffNorm and the nn.Identity default are pure
+        # functions of their input (DiffNorm is advanced explicitly via
+        # update_normalization), so fusing is exact for them.
+        if self.training and isinstance(self.obs_normalizer, EmpiricalNormalization):
+            scores = self.linear(self.trunk(self.obs_normalizer(combined_obs)))
+            policy_d, expert_d = scores[:num_policy], scores[num_policy:]
+            amp_loss, grad_pen = self.compute_loss(
+                policy_d=policy_d,
+                expert_d=expert_d,
+                expert_obs=combined_obs[num_policy:],
+                lambda_=lambda_,
+                policy_obs=combined_obs[:num_policy] if two_sided else None,
+            )
+            return amp_loss, grad_pen, policy_d, expert_d
+
+        data = self.obs_normalizer(combined_obs.detach())
+        if need_gp:
+            data = data.requires_grad_(True)
+        scores = self.linear(self.trunk(data))
+        policy_d, expert_d = scores[:num_policy], scores[num_policy:]
+
+        expert_loss = self.loss_fun(expert_d, torch.ones_like(expert_d))
+        policy_loss = self.loss_fun(policy_d, torch.zeros_like(policy_d))
+        amp_loss = 0.5 * (expert_loss + policy_loss)
+
+        if not need_gp:
+            return amp_loss, scores.new_zeros(()), policy_d, expert_d
+
+        grad = autograd.grad(
+            outputs=scores.sum(),
+            inputs=data,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        sq = grad.pow(2).sum(dim=1)
+        # Same per-class means the unfused two calls produce.
+        grad_pen = 0.5 * lambda_ * sq[num_policy:].mean()
+        if two_sided:
+            grad_pen = grad_pen + 0.5 * lambda_ * sq[:num_policy].mean()
+        return amp_loss, grad_pen, policy_d, expert_d
 
     def update_normalization(self, *batches: torch.Tensor) -> None:
         """Update normaliser statistics (no-op when using nn.Identity)."""

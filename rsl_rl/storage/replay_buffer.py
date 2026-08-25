@@ -47,6 +47,18 @@ class ReplayBuffer:
         self.step = end % self.buffer_size
         self.num_samples = min(self.buffer_size, self.num_samples + B)
 
+    def sample(self, n: int) -> torch.Tensor:
+        """Draw ``n`` observations uniformly WITH replacement.
+
+        Mirrors ``imitation.discriminator._ReplayBuffer.sample`` so the PPO and
+        FoRL-SHAC discriminator updates draw their replay batch the same way.
+        Returns fewer than ``n`` rows only when the buffer is still empty.
+        """
+        if self.num_samples == 0 or n <= 0:
+            return self.obs.new_zeros((0, self.obs.shape[1]))
+        idx = torch.randint(0, self.num_samples, (n,), device=self.device)
+        return self.obs[idx]
+
     def feed_forward_generator(
         self,
         num_mini_batch: int,

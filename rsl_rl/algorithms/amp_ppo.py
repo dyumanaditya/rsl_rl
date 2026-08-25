@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -28,11 +29,24 @@ from rsl_rl.storage.replay_buffer import ReplayBuffer
 
 
 class AMP_PPO:
-    """PPO with a jointly-trained AMP / ADD discriminator.
+    """PPO with an AMP / ADD discriminator trained on MimicKit's schedule.
 
-    The discriminator loss is combined with the PPO loss in a single
-    backward pass, exactly as in amp-rsl-rl, rather than being trained
-    in a separate optimisation step.
+    The discriminator is trained in its OWN optimisation loop after the PPO
+    epochs, with its own optimizer, on MimicKit's step count::
+
+        batch  = ceil(disc_batch_size * num_envs)          # disc_batch_size is per-env
+        steps  = ceil(rollout_samples / batch) * disc_epochs
+
+    (MimicKit ``amp_agent._update_model``/``_update_disc``; the same formula the
+    FoRL-SHAC path uses in ``imitation.discriminator.Discriminator.update``.)
+
+    This replaces the inherited amp-rsl-rl behaviour of folding the
+    discriminator loss into the PPO minibatch loss and taking a single backward
+    pass. That coupling pinned the discriminator to ``num_learning_epochs *
+    num_mini_batches`` steps at the PPO minibatch size and left
+    ``imitation.disc_epochs`` / ``disc_batch_size`` / ``disc_replay_samples``
+    dead, so PPO and FoRL-SHAC trained the same discriminator on different
+    schedules.
 
     Parameters
     ----------
@@ -54,6 +68,15 @@ class AMP_PPO:
         Capacity of the disc_obs replay buffer.
     grad_penalty_coeff:
         R1 gradient-penalty coefficient (λ).
+    disc_epochs:
+        Passes over the rollout's disc observations per update (MimicKit
+        ``disc_epochs``).
+    disc_batch_size:
+        Discriminator minibatch size PER ENV; scaled by ``num_envs`` at update
+        time, matching MimicKit's ``ceil(disc_batch_size * num_envs)``.
+    disc_replay_samples:
+        Number of replay observations mixed into each discriminator batch
+        alongside the current rollout (MimicKit ``disc_replay_samples``).
     """
 
     actor_critic: ActorCritic
@@ -81,6 +104,9 @@ class AMP_PPO:
         disc_lr: Optional[float] = None,
         amp_replay_buffer_size: int = 100_000,
         grad_penalty_coeff: float = 10.0,
+        disc_epochs: int = 2,
+        disc_batch_size: int = 2,
+        disc_replay_samples: int = 1000,
         device: str = "cpu",
     ) -> None:
         self.device = device
@@ -95,34 +121,51 @@ class AMP_PPO:
         self.amp_storage = ReplayBuffer(disc_obs_size, amp_replay_buffer_size, device)
         self.demo_fn = demo_fn
         self.grad_penalty_coeff = grad_penalty_coeff
+        self.disc_epochs = int(disc_epochs)
+        self.disc_batch_size = int(disc_batch_size)   # per-env, scaled at update time
+        self.disc_replay_samples = int(disc_replay_samples)
+        # Current iteration's disc observations, appended per rollout step by
+        # process_disc_step and consumed (then pushed to the replay) by
+        # _update_disc. Kept separate from amp_storage so the update can mix the
+        # FRESH rollout with replay exactly as MimicKit / FoRL-SHAC do.
+        self._rollout_disc_obs: list[torch.Tensor] = []
 
         # Actor-critic
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage: Optional[RolloutStorage] = None
 
-        # Single combined optimizer (actor-critic + discriminator).
-        # Discriminator trunk and head get separate weight decay, mirroring
-        # the amp-rsl-rl optimizer setup.
+        # SEPARATE optimizers, as MimicKit has (its disc has its own
+        # ``_disc_optimizer``). Previously both lived in one Adam because the two
+        # losses shared a backward pass; now that the discriminator has its own
+        # update loop, a shared optimizer would step the policy parameters on the
+        # disc iterations too (Adam moves a parameter whenever its group is
+        # stepped and it still holds momentum), which is exactly what we must not
+        # do. Discriminator trunk and head keep the amp-rsl-rl weight decays.
         _disc_lr = disc_lr if disc_lr is not None else learning_rate
-        params = [
-            {"params": self.actor_critic.parameters(), "lr": learning_rate},
-            {
-                "params": self.discriminator.trunk.parameters(),
-                "lr": _disc_lr,
-                "weight_decay": 10e-4,
-            },
-            {
-                "params": self.discriminator.linear.parameters(),
-                "lr": _disc_lr,
-                "weight_decay": 10e-2,
-            },
-        ]
-        self.optimizer = optim.Adam(params, lr=learning_rate)
-        # Only the actor-critic group follows the adaptive-KL LR schedule. The
-        # discriminator groups must keep their fixed ``_disc_lr`` (mimickit trains
-        # the disc with an independent optimizer); letting the policy KL drive the
-        # disc LR over-trains the discriminator and starves the style reward.
+        self.optimizer = optim.Adam(
+            [{"params": self.actor_critic.parameters(), "lr": learning_rate}],
+            lr=learning_rate,
+        )
+        self.disc_optimizer = optim.Adam(
+            [
+                {
+                    "params": self.discriminator.trunk.parameters(),
+                    "lr": _disc_lr,
+                    "weight_decay": 10e-4,
+                },
+                {
+                    "params": self.discriminator.linear.parameters(),
+                    "lr": _disc_lr,
+                    "weight_decay": 10e-2,
+                },
+            ],
+            lr=_disc_lr,
+        )
+        # The adaptive-KL schedule may only move the policy LR; the discriminator
+        # keeps its fixed ``_disc_lr``. That is now structural (separate
+        # optimizers) rather than a param-group carve-out, but the attribute is
+        # kept so the schedule code below reads the same.
         self._policy_param_group = self.optimizer.param_groups[0]
 
         self.transition = RolloutStorage.Transition()
@@ -227,7 +270,11 @@ class AMP_PPO:
             entry = self.discriminator.reduce((demo_disc_obs - disc_obs).detach())
         else:
             entry = self.discriminator.reduce(disc_obs.detach())
-        self.amp_storage.insert(entry)
+        # Held for this iteration's disc update, which pushes the whole rollout
+        # into ``amp_storage`` in one go (mirrors ADDDiscriminator._update_js:
+        # record -> replay.push -> sample). Inserting here instead would make the
+        # "fresh rollout" and "replay" batches indistinguishable.
+        self._rollout_disc_obs.append(entry)
 
     def compute_returns(self, last_critic_obs: torch.Tensor) -> None:
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
@@ -238,10 +285,10 @@ class AMP_PPO:
     # ------------------------------------------------------------------
 
     def update(self) -> Tuple[float, ...]:
-        """Joint PPO + discriminator update.
+        """PPO update, then the discriminator update on MimicKit's schedule.
 
-        Mirrors amp-rsl-rl AMP_PPO.update() but adapted for flat obs and
-        single-obs replay buffer.
+        The two are separate optimisation loops with separate optimizers (see the
+        class docstring); ``_update_disc`` runs after the PPO epochs.
 
         Returns
         -------
@@ -257,19 +304,9 @@ class AMP_PPO:
         dev = self.device
         sum_value_loss = torch.zeros((), device=dev)
         sum_surrogate_loss = torch.zeros((), device=dev)
-        sum_amp_loss = torch.zeros((), device=dev)
-        sum_grad_pen_loss = torch.zeros((), device=dev)
-        sum_policy_pred = torch.zeros((), device=dev)
-        sum_expert_pred = torch.zeros((), device=dev)
-        sum_acc_policy_num = torch.zeros((), device=dev)
-        sum_acc_expert_num = torch.zeros((), device=dev)
         mean_kl_divergence = 0.0
-        acc_policy_den = acc_expert_den = 0
 
         total_updates = self.num_learning_epochs * self.num_mini_batches
-        disc_batch_size = (
-            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches
-        )
 
         if self.actor_critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
@@ -280,13 +317,7 @@ class AMP_PPO:
                 self.num_mini_batches, self.num_learning_epochs
             )
 
-        disc_gen = self.amp_storage.feed_forward_generator(
-            num_mini_batch=total_updates,
-            mini_batch_size=disc_batch_size,
-            allow_replacement=True,
-        )
-
-        for sample, disc_policy_batch in zip(generator, disc_gen):
+        for sample in generator:
             (
                 obs_batch,
                 critic_obs_batch,
@@ -378,82 +409,143 @@ class AMP_PPO:
             )
 
             # ----------------------------------------------------------
-            # Discriminator loss
+            # PPO backward pass (policy/value only — the discriminator has its
+            # own loop and optimizer, see _update_disc)
             # ----------------------------------------------------------
-            disc_policy_batch = disc_policy_batch.to(self.device)
-            expert_batch = self.demo_fn(disc_policy_batch.shape[0]).to(self.device)
-
-            B_pol = disc_policy_batch.shape[0]
-            combined = torch.cat([disc_policy_batch, expert_batch], dim=0)
-            combined_d = self.discriminator(combined)
-            policy_d, expert_d = combined_d[:B_pol], combined_d[B_pol:]
-
-            amp_loss, grad_pen_loss = self.discriminator.compute_loss(
-                policy_d=policy_d,
-                expert_d=expert_d,
-                expert_obs=expert_batch,
-                lambda_=self.grad_penalty_coeff,
-                policy_obs=disc_policy_batch if self.mode == "add" else None,
-            )
-
-            # ----------------------------------------------------------
-            # Combined backward pass
-            # ----------------------------------------------------------
-            loss = ppo_loss + amp_loss + grad_pen_loss
-
             self.optimizer.zero_grad()
-            loss.backward()
+            ppo_loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
-
-            # Update normaliser: for ADD, only use policy diffs (not zeros) so
-            # DiffNorm tracks the true diff scale, not an average with zero.
-            if self.mode == "add":
-                self.discriminator.update_normalization(disc_policy_batch.detach())
-            else:
-                self.discriminator.update_normalization(
-                    disc_policy_batch.detach(), expert_batch.detach()
-                )
 
             # ----------------------------------------------------------
             # Statistics
             # ----------------------------------------------------------
             with torch.no_grad():
-                policy_prob = torch.sigmoid(policy_d)
-                expert_prob = torch.sigmoid(expert_d)
-
                 sum_value_loss += value_loss.detach()
                 sum_surrogate_loss += surrogate_loss.detach()
-                sum_amp_loss += amp_loss.detach()
-                sum_grad_pen_loss += grad_pen_loss.detach()
-                sum_policy_pred += policy_prob.mean()
-                sum_expert_pred += expert_prob.mean()
-                sum_acc_policy_num += (torch.round(policy_prob) == 0).sum()
-                sum_acc_expert_num += (torch.round(expert_prob) == 1).sum()
-                acc_policy_den += policy_prob.numel()
-                acc_expert_den += expert_prob.numel()
 
         # Read the accumulated device-side statistics back to host in one shot.
         mean_value_loss = sum_value_loss.item() / total_updates
         mean_surrogate_loss = sum_surrogate_loss.item() / total_updates
-        mean_amp_loss = sum_amp_loss.item() / total_updates
-        mean_grad_pen_loss = sum_grad_pen_loss.item() / total_updates
-        mean_policy_pred = sum_policy_pred.item() / total_updates
-        mean_expert_pred = sum_expert_pred.item() / total_updates
         mean_kl_divergence /= total_updates
-        acc_policy = sum_acc_policy_num.item() / max(1, acc_policy_den)
-        acc_expert = sum_acc_expert_num.item() / max(1, acc_expert_den)
+
+        disc_stats = self._update_disc()
 
         self.storage.clear()
 
         return (
             mean_value_loss,
             mean_surrogate_loss,
-            mean_amp_loss,
-            mean_grad_pen_loss,
-            mean_policy_pred,
-            mean_expert_pred,
-            acc_policy,
-            acc_expert,
+            disc_stats["amp_loss"],
+            disc_stats["grad_pen_loss"],
+            disc_stats["policy_pred"],
+            disc_stats["expert_pred"],
+            disc_stats["acc_policy"],
+            disc_stats["acc_expert"],
             mean_kl_divergence,
         )
+
+    def _update_disc(self) -> dict:
+        """Train the discriminator on MimicKit's schedule.
+
+        Step count and batch size follow MimicKit ``amp_agent._update_model``::
+
+            batch = ceil(disc_batch_size * num_envs)
+            steps = ceil(rollout_samples / batch) * disc_epochs
+
+        and each batch mixes this iteration's disc observations with
+        ``disc_replay_samples`` drawn from the replay buffer, exactly as
+        ``ADDDiscriminator._update_js`` does on the FoRL-SHAC side (record ->
+        replay.push -> sample fresh+replay with replacement).
+
+        For ADD the "policy" rows are the reduced residuals ``demo - agent`` and
+        ``demo_fn`` returns the zero vector (the perfect-match positive class);
+        for AMP they are agent disc observations and ``demo_fn`` samples the
+        motion library.
+        """
+        dev = self.device
+        zero = torch.zeros((), device=dev)
+        empty = {
+            "amp_loss": 0.0, "grad_pen_loss": 0.0, "policy_pred": 0.0,
+            "expert_pred": 0.0, "acc_policy": 0.0, "acc_expert": 0.0,
+            "num_steps": 0, "batch_size": 0,
+        }
+        if not self._rollout_disc_obs:
+            return empty
+
+        # Fresh rollout observations, then hand them to the replay buffer.
+        agent_obs = torch.cat(self._rollout_disc_obs, dim=0)
+        self._rollout_disc_obs = []
+        self.amp_storage.insert(agent_obs)
+
+        num_envs = self.storage.num_envs if self.storage is not None else 1
+        batch_size = max(1, int(math.ceil(self.disc_batch_size * num_envs)))
+        num_batches = max(1, int(math.ceil(agent_obs.shape[0] / batch_size)))
+        num_steps = num_batches * max(1, self.disc_epochs)
+
+        sum_amp_loss = zero.clone()
+        sum_grad_pen = zero.clone()
+        sum_policy_pred = zero.clone()
+        sum_expert_pred = zero.clone()
+        sum_acc_policy = zero.clone()
+        sum_acc_expert = zero.clone()
+        acc_policy_den = acc_expert_den = 0
+
+        for _ in range(num_steps):
+            replay_obs = self.amp_storage.sample(self.disc_replay_samples)
+            pool = (
+                torch.cat([agent_obs, replay_obs], dim=0)
+                if replay_obs.shape[0] > 0
+                else agent_obs
+            )
+            idx = torch.randint(0, pool.shape[0], (batch_size,), device=dev)
+            policy_batch = pool[idx]
+            expert_batch = self.demo_fn(batch_size).to(dev)
+
+            # One trunk forward for both the logits and the R1 penalty; the
+            # unfused forward()+compute_loss() pair ran it three times per batch
+            # (logits, then once inside each compute_grad_pen call — two of them
+            # for ADD's two-sided penalty). Numerically identical, see
+            # Discriminator.compute_loss_fused.
+            amp_loss, grad_pen_loss, policy_d, expert_d = self.discriminator.compute_loss_fused(
+                combined_obs=torch.cat([policy_batch, expert_batch], dim=0),
+                num_policy=batch_size,
+                lambda_=self.grad_penalty_coeff,
+                two_sided=(self.mode == "add"),
+            )
+
+            self.disc_optimizer.zero_grad()
+            (amp_loss + grad_pen_loss).backward()
+            self.disc_optimizer.step()
+
+            # Update normaliser: for ADD, only use policy diffs (not zeros) so
+            # DiffNorm tracks the true diff scale, not an average with zero.
+            if self.mode == "add":
+                self.discriminator.update_normalization(policy_batch.detach())
+            else:
+                self.discriminator.update_normalization(
+                    policy_batch.detach(), expert_batch.detach()
+                )
+
+            with torch.no_grad():
+                policy_prob = torch.sigmoid(policy_d)
+                expert_prob = torch.sigmoid(expert_d)
+                sum_amp_loss += amp_loss.detach()
+                sum_grad_pen += grad_pen_loss.detach()
+                sum_policy_pred += policy_prob.mean()
+                sum_expert_pred += expert_prob.mean()
+                sum_acc_policy += (torch.round(policy_prob) == 0).sum()
+                sum_acc_expert += (torch.round(expert_prob) == 1).sum()
+                acc_policy_den += policy_prob.numel()
+                acc_expert_den += expert_prob.numel()
+
+        return {
+            "amp_loss": sum_amp_loss.item() / num_steps,
+            "grad_pen_loss": sum_grad_pen.item() / num_steps,
+            "policy_pred": sum_policy_pred.item() / num_steps,
+            "expert_pred": sum_expert_pred.item() / num_steps,
+            "acc_policy": sum_acc_policy.item() / max(1, acc_policy_den),
+            "acc_expert": sum_acc_expert.item() / max(1, acc_expert_den),
+            "num_steps": num_steps,
+            "batch_size": batch_size,
+        }
