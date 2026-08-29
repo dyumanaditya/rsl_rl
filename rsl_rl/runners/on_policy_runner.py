@@ -183,6 +183,10 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            # plant curriculum: anneal the reflected rotor inertia (no-op unless
+            # sim.armature_curriculum is set).
+            if hasattr(self.env, "maybe_update_armature"):
+                self.env.maybe_update_armature(it)
             # Rollout
             with torch.inference_mode():
                 for step in range(self.num_steps_per_env):

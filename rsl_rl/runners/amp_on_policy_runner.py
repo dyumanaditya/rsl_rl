@@ -376,6 +376,10 @@ class AMPOnPolicyRunner:
 
         for it in range(start_iter, tot_iter):
             start = time.time()
+            # plant curriculum: anneal the reflected rotor inertia (no-op unless
+            # sim.armature_curriculum is set).
+            if hasattr(self.env, "maybe_update_armature"):
+                self.env.maybe_update_armature(it)
 
             mean_style_reward_log = 0.0
             mean_task_reward_log = 0.0
