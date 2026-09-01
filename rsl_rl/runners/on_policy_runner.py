@@ -62,7 +62,14 @@ class OnPolicyRunner:
 
         # init algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        # Drop keys this algorithm does not take, as AMPOnPolicyRunner already
+        # does. The shared `ppo.algorithm` config block carries AMP/ADD-only
+        # settings (separate actor/critic optimizer rates and clips, MimicKit's
+        # advantage clip, the return-scaled value clip); without this filter a
+        # plain non-imitation `alg=ppo` run dies on an unexpected keyword.
+        _alg_params = set(alg_class.__init__.__code__.co_varnames)
+        alg_kwargs = {k: v for k, v in self.alg_cfg.items() if k in _alg_params}
+        self.alg: PPO = alg_class(actor_critic, device=self.device, **alg_kwargs)
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]

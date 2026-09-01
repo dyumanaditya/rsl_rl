@@ -96,10 +96,17 @@ class AMP_PPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.0,
         learning_rate: float = 1e-3,
+        critic_learning_rate: Optional[float] = None,
         max_grad_norm: float = 1.0,
+        critic_max_grad_norm: Optional[float] = None,
         use_clipped_value_loss: bool = True,
+        value_clip_scale: float = 0.0,
+        norm_adv_clip: float = 0.0,
         schedule: str = "fixed",
         desired_kl: float = 0.01,
+        desired_kl_per_action_dim: bool = False,
+        min_learning_rate: float = 1e-5,
+        max_learning_rate: float = 1e-2,
         # Discriminator hyper-parameters
         disc_lr: Optional[float] = None,
         amp_replay_buffer_size: int = 100_000,
@@ -107,13 +114,30 @@ class AMP_PPO:
         disc_epochs: int = 2,
         disc_batch_size: int = 2,
         disc_replay_samples: int = 1000,
+        disc_logit_reg: float = 0.0,
         device: str = "cpu",
     ) -> None:
         self.device = device
-        self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.min_learning_rate = float(min_learning_rate)
+        self.max_learning_rate = float(max_learning_rate)
+        self.norm_adv_clip = float(norm_adv_clip)
+        self.value_clip_scale = float(value_clip_scale)
         self.mode = mode
+
+        # The adaptive-KL target is a SUM over action dimensions, so the tuned
+        # rsl_rl default (0.01, calibrated on 12-DoF quadrupeds) is a ~2.4x
+        # tighter trust region on a 29-DoF humanoid. With
+        # ``desired_kl_per_action_dim`` the config value is read PER DIMENSION and
+        # scaled by num_actions here, so the same number means the same policy
+        # displacement regardless of the robot.
+        self._num_actions = int(actor_critic.std.numel()) if hasattr(actor_critic, "std") else 1
+        self.desired_kl = (
+            float(desired_kl) * self._num_actions
+            if desired_kl is not None and desired_kl_per_action_dim
+            else desired_kl
+        )
 
         # Discriminator
         self.discriminator = discriminator.to(self.device)
@@ -124,6 +148,12 @@ class AMP_PPO:
         self.disc_epochs = int(disc_epochs)
         self.disc_batch_size = int(disc_batch_size)   # per-env, scaled at update time
         self.disc_replay_samples = int(disc_replay_samples)
+        # MimicKit `disc_logit_reg` (add_agent._compute_disc_loss) — an explicit
+        # L2 on the classifier HEAD weights, which FoRL-SHAC also applies
+        # (imitation/discriminator.py _train_step). This path had neither, only
+        # amp-rsl-rl's optimizer weight decay, so the same `imitation.disc_logit_reg`
+        # config value shaped the discriminator under SHAC and was dead under PPO.
+        self.disc_logit_reg = float(disc_logit_reg)
         # Current iteration's disc observations, appended per rollout step by
         # process_disc_step and consumed (then pushed to the replay) by
         # _update_disc. Kept separate from amp_storage so the update can mix the
@@ -142,10 +172,45 @@ class AMP_PPO:
         # disc iterations too (Adam moves a parameter whenever its group is
         # stepped and it still holds momentum), which is exactly what we must not
         # do. Discriminator trunk and head keep the amp-rsl-rl weight decays.
+        #
+        # The ACTOR and the CRITIC also get their own optimizers, matching
+        # MimicKit (``_actor_optimizer`` / ``_critic_optimizer``) and FoRL-SHAC
+        # (``actor_optimizer`` / ``critic_optimizer``). Sharing one was actively
+        # harmful here: ``clip_grad_norm_`` was applied to the CONCATENATED
+        # actor+critic gradient, and the ADD reward is dense and unnormalised
+        # (returns ~60), so the value loss — and with it the critic gradient —
+        # dominates the joint norm. Measured on this env: |g_critic| ~ 11 vs
+        # |g_actor| ~ 1.8, so a max_grad_norm of 1.0 rescaled BOTH by ~0.16, and
+        # the factor swung between 0.03 and 0.31 from iteration to iteration
+        # purely as a function of how well the critic happened to fit. The actor's
+        # step size was therefore set by the critic's loss magnitude. Clipping the
+        # two groups separately decouples them, and a separate critic LR keeps the
+        # adaptive-KL schedule (a POLICY trust region) off the value function.
         _disc_lr = disc_lr if disc_lr is not None else learning_rate
+        _critic_lr = (
+            float(critic_learning_rate) if critic_learning_rate is not None else learning_rate
+        )
+        self.critic_learning_rate = _critic_lr
+        # Split by NAME so ``std`` (an actor-side Parameter living directly on the
+        # module) lands with the actor, and ActorCriticRecurrent's ``memory_c``
+        # encoder lands with the critic it feeds.
+        _critic_prefixes = ("critic.", "memory_c.")
+        self.actor_params = [
+            p for n, p in self.actor_critic.named_parameters()
+            if not n.startswith(_critic_prefixes)
+        ]
+        self.critic_params = [
+            p for n, p in self.actor_critic.named_parameters()
+            if n.startswith(_critic_prefixes)
+        ]
+        assert len(self.actor_params) + len(self.critic_params) == len(
+            list(self.actor_critic.parameters())
+        ), "actor/critic parameter split did not cover every parameter"
         self.optimizer = optim.Adam(
-            [{"params": self.actor_critic.parameters(), "lr": learning_rate}],
-            lr=learning_rate,
+            [{"params": self.actor_params, "lr": learning_rate}], lr=learning_rate
+        )
+        self.critic_optimizer = optim.Adam(
+            [{"params": self.critic_params, "lr": _critic_lr}], lr=_critic_lr
         )
         self.disc_optimizer = optim.Adam(
             [
@@ -162,11 +227,18 @@ class AMP_PPO:
             ],
             lr=_disc_lr,
         )
-        # The adaptive-KL schedule may only move the policy LR; the discriminator
-        # keeps its fixed ``_disc_lr``. That is now structural (separate
+        # The adaptive-KL schedule may only move the ACTOR LR; the critic and the
+        # discriminator keep their fixed rates. That is now structural (separate
         # optimizers) rather than a param-group carve-out, but the attribute is
         # kept so the schedule code below reads the same.
         self._policy_param_group = self.optimizer.param_groups[0]
+
+        # Per-update diagnostics the runner mirrors to tensorboard/wandb. Without
+        # them a starved actor is invisible: the reported losses look healthy
+        # while the actor is taking near-zero steps.
+        self.last_actor_grad_norm = 0.0
+        self.last_critic_grad_norm = 0.0
+        self.last_clip_frac = 0.0
 
         self.transition = RolloutStorage.Transition()
 
@@ -179,6 +251,15 @@ class AMP_PPO:
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
+        # FoRL-SHAC gives the critic 10x the actor's clip (forl_cfg.py:39) and
+        # MimicKit clips neither. Now that the two groups are clipped separately,
+        # a shared 1.0 would be a much TIGHTER bound on the critic than it ever
+        # was under the joint clip, so follow SHAC's ratio by default.
+        self.critic_max_grad_norm = (
+            float(critic_max_grad_norm)
+            if critic_max_grad_norm is not None
+            else 10.0 * max_grad_norm
+        )
         self.use_clipped_value_loss = use_clipped_value_loss
 
     # ------------------------------------------------------------------
@@ -304,6 +385,9 @@ class AMP_PPO:
         dev = self.device
         sum_value_loss = torch.zeros((), device=dev)
         sum_surrogate_loss = torch.zeros((), device=dev)
+        sum_actor_grad_norm = torch.zeros((), device=dev)
+        sum_critic_grad_norm = torch.zeros((), device=dev)
+        sum_clip_frac = torch.zeros((), device=dev)
         mean_kl_divergence = 0.0
 
         total_updates = self.num_learning_epochs * self.num_mini_batches
@@ -352,7 +436,11 @@ class AMP_PPO:
             # ----------------------------------------------------------
             # Adaptive KL / learning-rate schedule
             # ----------------------------------------------------------
-            if self.desired_kl is not None and self.schedule == "adaptive":
+            # The KL is always MEASURED (it is the one number that says whether the
+            # policy is actually moving); only the learning-rate reaction is gated
+            # on the adaptive schedule. It used to be computed inside that gate, so
+            # a `schedule: fixed` run logged Loss/kl_divergence == 0.
+            if self.desired_kl is not None:
                 with torch.inference_mode():
                     kl = torch.sum(
                         torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
@@ -367,23 +455,37 @@ class AMP_PPO:
                     kl_mean = torch.mean(kl)
                     mean_kl_divergence += kl_mean.item()
 
-                    if kl_mean > self.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    # Update only the policy group's LR; leave the disc groups
-                    # pinned at their fixed _disc_lr (see __init__).
-                    self._policy_param_group["lr"] = self.learning_rate
+                    if self.schedule == "adaptive":
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(
+                                self.min_learning_rate, self.learning_rate / 1.5
+                            )
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(
+                                self.max_learning_rate, self.learning_rate * 1.5
+                            )
+                        # Update only the policy group's LR; the critic and the
+                        # disc keep their own fixed rates (separate optimizers).
+                        self._policy_param_group["lr"] = self.learning_rate
 
             # ----------------------------------------------------------
             # PPO surrogate loss
             # ----------------------------------------------------------
+            advantages_batch = torch.squeeze(advantages_batch)
+            if self.norm_adv_clip > 0.0:
+                # MimicKit ``norm_adv_clip``: the advantages arrive already
+                # standardised (RolloutStorage.compute_returns), and a single
+                # heavy-tailed transition otherwise dominates a minibatch's
+                # surrogate gradient — which shows up as an outsized KL and, under
+                # the adaptive schedule, as a collapsed learning rate.
+                advantages_batch = advantages_batch.clamp(
+                    -self.norm_adv_clip, self.norm_adv_clip
+                )
             ratio = torch.exp(
                 actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
             )
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+            surrogate = -advantages_batch * ratio
+            surrogate_clipped = -advantages_batch * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
@@ -392,9 +494,23 @@ class AMP_PPO:
             # Value loss
             # ----------------------------------------------------------
             if self.use_clipped_value_loss:
+                # The PPO value clip is an ABSOLUTE bound in return units, so it
+                # only makes sense when returns are O(1). Imitation returns here
+                # are ~60 (a dense ~0.65/step style reward over a ~230-step clip),
+                # and a +-0.2 clip then freezes the critic's gradient after it has
+                # moved 0.2 per iteration -- the value loss in the 5.5k-iteration
+                # jumps_15s run never dropped below ~35. ``value_clip_scale``
+                # makes the bound RELATIVE to the batch's return scale; 0 keeps
+                # the legacy absolute ``clip_param``.
+                if self.value_clip_scale > 0.0:
+                    v_clip = self.value_clip_scale * (
+                        returns_batch.std().detach() + 1.0e-8
+                    )
+                else:
+                    v_clip = self.clip_param
                 value_clipped = target_values_batch + (
                     value_batch - target_values_batch
-                ).clamp(-self.clip_param, self.clip_param)
+                ).clamp(-v_clip, v_clip)
                 value_loss = torch.max(
                     (value_batch - returns_batch).pow(2),
                     (value_clipped - returns_batch).pow(2),
@@ -411,11 +527,19 @@ class AMP_PPO:
             # ----------------------------------------------------------
             # PPO backward pass (policy/value only — the discriminator has its
             # own loop and optimizer, see _update_disc)
+            #
+            # ONE backward over the summed loss (the actor and critic MLPs are
+            # disjoint subgraphs, so each parameter still receives exactly its own
+            # loss's gradient), then clip and step the two groups SEPARATELY so
+            # the critic's gradient magnitude cannot rescale the actor's step.
             # ----------------------------------------------------------
             self.optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()
             ppo_loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            a_norm = nn.utils.clip_grad_norm_(self.actor_params, self.max_grad_norm)
+            c_norm = nn.utils.clip_grad_norm_(self.critic_params, self.critic_max_grad_norm)
             self.optimizer.step()
+            self.critic_optimizer.step()
 
             # ----------------------------------------------------------
             # Statistics
@@ -423,11 +547,19 @@ class AMP_PPO:
             with torch.no_grad():
                 sum_value_loss += value_loss.detach()
                 sum_surrogate_loss += surrogate_loss.detach()
+                sum_actor_grad_norm += a_norm.detach()
+                sum_critic_grad_norm += c_norm.detach()
+                sum_clip_frac += (
+                    (ratio - 1.0).abs() > self.clip_param
+                ).float().mean()
 
         # Read the accumulated device-side statistics back to host in one shot.
         mean_value_loss = sum_value_loss.item() / total_updates
         mean_surrogate_loss = sum_surrogate_loss.item() / total_updates
         mean_kl_divergence /= total_updates
+        self.last_actor_grad_norm = sum_actor_grad_norm.item() / total_updates
+        self.last_critic_grad_norm = sum_critic_grad_norm.item() / total_updates
+        self.last_clip_frac = sum_clip_frac.item() / total_updates
 
         disc_stats = self._update_disc()
 
@@ -514,8 +646,14 @@ class AMP_PPO:
                 two_sided=(self.mode == "add"),
             )
 
+            disc_loss = amp_loss + grad_pen_loss
+            if self.disc_logit_reg > 0.0:
+                # Weights only (no bias), matching MimicKit's
+                # `get_disc_logit_weights` and SHAC's `p.ndim > 1` filter.
+                disc_loss = disc_loss + self.disc_logit_reg * self.discriminator.linear.weight.pow(2).sum()
+
             self.disc_optimizer.zero_grad()
-            (amp_loss + grad_pen_loss).backward()
+            disc_loss.backward()
             self.disc_optimizer.step()
 
             # Update normaliser: for ADD, only use policy diffs (not zeros) so

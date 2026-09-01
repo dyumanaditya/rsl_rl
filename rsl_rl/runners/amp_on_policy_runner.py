@@ -194,6 +194,7 @@ class AMPOnPolicyRunner:
                 disc_epochs=getattr(im_cfg, "disc_epochs", 2),
                 disc_batch_size=getattr(im_cfg, "disc_batch_size", 2),
                 disc_replay_samples=getattr(im_cfg, "disc_replay_samples", 1000),
+                disc_logit_reg=getattr(im_cfg, "disc_logit_reg", 0.0),
                 device=self.device,
                 **alg_kwargs,
             )
@@ -237,6 +238,31 @@ class AMPOnPolicyRunner:
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.save_interval: int = self.cfg["save_interval"]
         self.empirical_normalization: bool = self.cfg.get("empirical_normalization", False)
+
+        # Action-rate regularisation (BeyondMimic action_rate_l2), byte-for-byte
+        # the FoRL-SHAC term in forl/algorithms/shac.py: it is added to the total
+        # reward DIRECTLY (not gated by task_reward_weight, so it stays live for
+        # pure-imitation ADD) and scaled by the control period so its absolute
+        # magnitude matches IsaacLab's step_dt-multiplied reward manager.
+        # ``env.action_rate_reward_weight`` used to be read only by SHAC, so under
+        # alg=ppo it was a silent no-op and the two algorithms optimised different
+        # objectives from the same config.
+        env_cfg = getattr(getattr(self.env, "cfg", None), "env", None)
+        self.action_rate_weight = float(
+            getattr(env_cfg, "action_rate_reward_weight", 0.0) if env_cfg else 0.0
+        )
+        self._action_rate_dt = float(
+            getattr(getattr(getattr(self.env, "cfg", None), "sim", None), "dt", 0.02)
+        )
+        self._act_rate_prev: torch.Tensor | None = None
+        self.mean_action_rate_reward = 0.0
+        if self.action_rate_weight != 0.0:
+            print(
+                f"[AMPOnPolicyRunner] action-rate reward enabled: weight="
+                f"{self.action_rate_weight} * dt({self._action_rate_dt}) * "
+                f"sum_j (a_t - a_(t-1))^2 (BeyondMimic-scaled; added directly, "
+                f"not gated by task_reward_weight)."
+            )
 
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
@@ -306,6 +332,32 @@ class AMPOnPolicyRunner:
             )
         finally:
             self.train_mode()
+
+    def _apply_action_rate_reward(self, rewards, actions, dones, act_rate_sum):
+        """Add the BeyondMimic action-rate penalty, mirroring FoRL-SHAC exactly.
+
+        ``-|w| * dt * sum_j (a_t - a_(t-1))^2``, added straight onto the already
+        blended reward so it survives ``task_reward_weight=0``. Done envs get
+        their previous action reset to zero, so the first action after an RSI
+        reset is penalised against zero rather than against a stale action from
+        another clip -- the same rule ``forl/algorithms/shac.py`` applies.
+        No-op when ``env.action_rate_reward_weight`` is 0 (the default).
+        """
+        if self.action_rate_weight == 0.0:
+            return rewards
+        if self._act_rate_prev is None or self._act_rate_prev.shape != actions.shape:
+            self._act_rate_prev = torch.zeros_like(actions)
+        act_rate = torch.sum((actions - self._act_rate_prev) ** 2, dim=-1)
+        rewards = rewards + self.action_rate_weight * self._action_rate_dt * act_rate
+        self._act_rate_prev = actions.clone()
+        done_ids = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
+        if done_ids.numel() > 0:
+            self._act_rate_prev[done_ids] = 0.0
+        if act_rate_sum is not None:
+            # In-place: the caller owns the accumulator (a 0-dim device tensor
+            # read back with one .item() after the rollout, no per-step sync).
+            act_rate_sum.add_(act_rate.mean())
+        return rewards
 
     def _make_renderer(self):
         try:
@@ -398,6 +450,10 @@ class AMPOnPolicyRunner:
                     [torch.zeros((), device=self.device) for _ in range(3)]
                     if self.aux_root else None
                 )
+                act_rate_sum = (
+                    torch.zeros((), device=self.device)
+                    if self.action_rate_weight != 0.0 else None
+                )
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
 
@@ -463,6 +519,9 @@ class AMPOnPolicyRunner:
                         task_w = getattr(self.im_cfg, "task_reward_weight", 0.5)
                         disc_w = getattr(self.im_cfg, "disc_reward_weight", 0.5)
                         blended_rewards = task_w * rewards + disc_w * style_rewards
+                        blended_rewards = self._apply_action_rate_reward(
+                            blended_rewards, actions, dones, act_rate_sum
+                        )
 
                         self.alg.process_env_step(blended_rewards, dones, infos)
 
@@ -476,8 +535,10 @@ class AMPOnPolicyRunner:
                     else:
                         # DeepMimic: env.step() already returns the tracking reward.
                         style_rewards = torch.zeros_like(rewards)
-                        blended_rewards = rewards
                         mean_task_reward_log += rewards.mean().item()
+                        blended_rewards = self._apply_action_rate_reward(
+                            rewards, actions, dones, act_rate_sum
+                        )
                         self.alg.process_env_step(blended_rewards, dones, infos)
 
                     # ---- Logging ----
@@ -522,6 +583,14 @@ class AMPOnPolicyRunner:
 
             mean_style_reward_log /= self.num_steps_per_env
             mean_task_reward_log /= self.num_steps_per_env
+            if act_rate_sum is not None:
+                # Same key and same definition as FoRL-SHAC's Reward/action_rate_reward.
+                self.mean_action_rate_reward = (
+                    self.action_rate_weight
+                    * self._action_rate_dt
+                    * act_rate_sum.item()
+                    / self.num_steps_per_env
+                )
             if aux_sums is not None:
                 mean_aux_root_log = aux_sums[0].item() / self.num_steps_per_env
                 mean_aux_root_pos_log = aux_sums[1].item() / self.num_steps_per_env
@@ -625,6 +694,21 @@ class AMPOnPolicyRunner:
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/policy", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+        # Actor/critic gradient norms + PPO clip fraction. Same keys FoRL-SHAC
+        # logs, so the two algorithms are comparable in wandb. These are the
+        # scalars that expose a starved actor: a clip fraction pinned near zero
+        # with the learning rate parked on its adaptive-schedule floor means the
+        # policy is not moving, however healthy the losses look.
+        if hasattr(self.alg, "last_actor_grad_norm"):
+            self.writer.add_scalar("Loss/Actor Grad Norm", self.alg.last_actor_grad_norm, locs["it"])
+            self.writer.add_scalar("Loss/Critic Grad Norm", self.alg.last_critic_grad_norm, locs["it"])
+            self.writer.add_scalar("Loss/clip_frac", self.alg.last_clip_frac, locs["it"])
+        if hasattr(self.alg, "critic_learning_rate"):
+            self.writer.add_scalar("Train/critic_lr", self.alg.critic_learning_rate, locs["it"])
+        if self.action_rate_weight != 0.0:
+            self.writer.add_scalar(
+                "Reward/action_rate_reward", self.mean_action_rate_reward, locs["it"]
+            )
         if self.has_discriminator:
             self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
             self.writer.add_scalar("Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"])
@@ -696,6 +780,13 @@ class AMPOnPolicyRunner:
             )
         elif locs["mean_entropy"] is not None:
             log_string += f"""{'Entropy:':>{pad}} {locs['mean_entropy']:.4f}\n"""
+        if hasattr(self.alg, "last_actor_grad_norm"):
+            log_string += (
+                f"""{'Grad norm (actor/critic):':>{pad}} """
+                f"""{self.alg.last_actor_grad_norm:.3f} / {self.alg.last_critic_grad_norm:.3f}\n"""
+                f"""{'PPO clip frac / lr:':>{pad}} """
+                f"""{self.alg.last_clip_frac:.3f} / {self.alg.learning_rate:.2e}\n"""
+            )
         log_string += f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
         if len(locs["rewbuffer"]) > 0:
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
@@ -737,6 +828,10 @@ class AMPOnPolicyRunner:
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
+        # The critic has its own optimizer since the actor/critic split; older
+        # checkpoints carry only the joint one, which load() tolerates.
+        if hasattr(self.alg, "critic_optimizer"):
+            saved_dict["critic_optimizer_state_dict"] = self.alg.critic_optimizer.state_dict()
         if self.has_discriminator:
             saved_dict["discriminator_state_dict"] = self.alg.discriminator.state_dict()
             # The discriminator has its own optimizer (MimicKit-style separate
@@ -763,9 +858,15 @@ class AMPOnPolicyRunner:
         if load_optimizer:
             # Checkpoints written before the policy/discriminator optimizer split
             # hold one Adam with three param groups (actor-critic + disc trunk +
-            # disc head); the current `optimizer` has only the actor-critic group,
-            # so loading them raises. The weights above are already restored, so
-            # fall back to fresh optimizer state rather than failing the resume.
+            # disc head); the current `optimizer` has only the actor group, so
+            # loading them raises. Same for checkpoints predating the actor/critic
+            # split, whose single group holds actor AND critic tensors. The
+            # weights above are already restored, so fall back to fresh optimizer
+            # state rather than failing the resume.
+            if hasattr(self.alg, "critic_optimizer") and "critic_optimizer_state_dict" in loaded_dict:
+                self.alg.critic_optimizer.load_state_dict(
+                    loaded_dict["critic_optimizer_state_dict"]
+                )
             try:
                 self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             except ValueError as exc:
