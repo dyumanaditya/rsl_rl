@@ -359,6 +359,35 @@ class AMPOnPolicyRunner:
             act_rate_sum.add_(act_rate.mean())
         return rewards
 
+    @staticmethod
+    def _normalize_without_update(normalizer, observations):
+        """Apply a running normalizer without recording terminal observations."""
+        was_training = normalizer.training
+        normalizer.eval()
+        try:
+            return normalizer(observations)
+        finally:
+            normalizer.train(was_training)
+
+    def _timeout_values(self, infos):
+        """Evaluate pre-reset terminal states used for timeout bootstrapping.
+
+        Recurrent policies retain the legacy current-state fallback because an
+        all-env terminal forward would advance live environments' hidden state.
+        The G1 imitation policies are feed-forward.
+        """
+        if self.alg.actor_critic.is_recurrent:
+            return None
+        terminal_obs = infos.get("terminal_critic_obs")
+        time_outs = infos.get("time_outs")
+        if terminal_obs is None or time_outs is None:
+            return None
+        terminal_obs = terminal_obs.to(self.device)
+        terminal_obs = self._normalize_without_update(
+            self.critic_obs_normalizer, terminal_obs
+        )
+        return self.alg.actor_critic.evaluate(terminal_obs).detach().squeeze(-1)
+
     def _make_renderer(self):
         try:
             viz_cfg = getattr(getattr(self.env, "cfg", None), "viz", None)
@@ -523,7 +552,12 @@ class AMPOnPolicyRunner:
                             blended_rewards, actions, dones, act_rate_sum
                         )
 
-                        self.alg.process_env_step(blended_rewards, dones, infos)
+                        self.alg.process_env_step(
+                            blended_rewards,
+                            dones,
+                            infos,
+                            timeout_values=self._timeout_values(infos),
+                        )
 
                         # Insert into disc replay buffer
                         self.alg.process_disc_step(next_disc_obs, next_demo_disc_obs)
@@ -825,6 +859,13 @@ class AMPOnPolicyRunner:
         saved_dict = {
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "optimizer_class_names": {
+                "actor": type(self.alg.optimizer).__name__,
+                "critic": type(self.alg.critic_optimizer).__name__
+                if hasattr(self.alg, "critic_optimizer") else None,
+                "disc": type(self.alg.disc_optimizer).__name__
+                if self.has_discriminator else None,
+            },
             "iter": self.current_learning_iteration,
             "infos": infos,
         }
@@ -863,22 +904,49 @@ class AMPOnPolicyRunner:
             # split, whose single group holds actor AND critic tensors. The
             # weights above are already restored, so fall back to fresh optimizer
             # state rather than failing the resume.
-            if hasattr(self.alg, "critic_optimizer") and "critic_optimizer_state_dict" in loaded_dict:
-                self.alg.critic_optimizer.load_state_dict(
-                    loaded_dict["critic_optimizer_state_dict"]
+            saved_names = loaded_dict.get("optimizer_class_names", {})
+
+            def load_optimizer_state(optimizer, state_key, name_key):
+                state = loaded_dict.get(state_key)
+                if state is None:
+                    return
+                current_name = type(optimizer).__name__
+                saved_name = saved_names.get(name_key)
+                if saved_name is None and state.get("param_groups"):
+                    # Older checkpoints did not record the class. Adam groups
+                    # contain `betas`; SGD groups contain `momentum`.
+                    group = state["param_groups"][0]
+                    saved_name = "Adam" if "betas" in group else (
+                        "SGD" if "momentum" in group else None
+                    )
+                if saved_name is not None and saved_name != current_name:
+                    print(
+                        f"[AMPOnPolicyRunner] ignoring {saved_name} {name_key} optimizer "
+                        f"state in {path}; current config uses {current_name}."
+                    )
+                    return
+                try:
+                    optimizer.load_state_dict(state)
+                except (ValueError, KeyError) as exc:
+                    print(
+                        f"[AMPOnPolicyRunner] ignoring incompatible {name_key} optimizer "
+                        f"state in {path} ({exc}); resuming with fresh state."
+                    )
+
+            load_optimizer_state(
+                self.alg.optimizer, "optimizer_state_dict", "actor"
+            )
+            if hasattr(self.alg, "critic_optimizer"):
+                load_optimizer_state(
+                    self.alg.critic_optimizer,
+                    "critic_optimizer_state_dict",
+                    "critic",
                 )
-            try:
-                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            except ValueError as exc:
-                print(
-                    f"[AMPOnPolicyRunner] ignoring incompatible optimizer state in "
-                    f"{path} ({exc}); resuming with fresh optimizer state. This is "
-                    "expected for checkpoints predating the separate discriminator "
-                    "optimizer."
-                )
-            if self.has_discriminator and "disc_optimizer_state_dict" in loaded_dict:
-                self.alg.disc_optimizer.load_state_dict(
-                    loaded_dict["disc_optimizer_state_dict"]
+            if self.has_discriminator:
+                load_optimizer_state(
+                    self.alg.disc_optimizer,
+                    "disc_optimizer_state_dict",
+                    "disc",
                 )
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict.get("infos")

@@ -95,8 +95,15 @@ class AMP_PPO:
         lam: float = 0.95,
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.0,
+        action_bound_weight: float = 0.0,
         learning_rate: float = 1e-3,
         critic_learning_rate: Optional[float] = None,
+        actor_optimizer_class_name: str = "Adam",
+        critic_optimizer_class_name: Optional[str] = None,
+        disc_optimizer_class_name: Optional[str] = None,
+        optimizer_momentum: float = 0.9,
+        disc_weight_decay: float = 1.0e-3,
+        disc_head_weight_decay: float = 1.0e-1,
         max_grad_norm: float = 1.0,
         critic_max_grad_norm: Optional[float] = None,
         use_clipped_value_loss: bool = True,
@@ -206,26 +213,47 @@ class AMP_PPO:
         assert len(self.actor_params) + len(self.critic_params) == len(
             list(self.actor_critic.parameters())
         ), "actor/critic parameter split did not cover every parameter"
-        self.optimizer = optim.Adam(
-            [{"params": self.actor_params, "lr": learning_rate}], lr=learning_rate
+        def make_optimizer(name, param_groups, lr):
+            name = str(name).lower()
+            if name == "adam":
+                return optim.Adam(param_groups, lr=lr)
+            if name == "adamw":
+                return optim.AdamW(param_groups, lr=lr)
+            if name == "sgd":
+                return optim.SGD(param_groups, lr=lr, momentum=float(optimizer_momentum))
+            raise ValueError(
+                f"Unsupported AMP_PPO optimizer {name!r}; expected Adam, AdamW, or SGD."
+            )
+
+        critic_optimizer_class_name = (
+            critic_optimizer_class_name or actor_optimizer_class_name
         )
-        self.critic_optimizer = optim.Adam(
-            [{"params": self.critic_params, "lr": _critic_lr}], lr=_critic_lr
+        disc_optimizer_class_name = disc_optimizer_class_name or actor_optimizer_class_name
+        self.optimizer = make_optimizer(
+            actor_optimizer_class_name,
+            [{"params": self.actor_params, "lr": learning_rate}],
+            learning_rate,
         )
-        self.disc_optimizer = optim.Adam(
+        self.critic_optimizer = make_optimizer(
+            critic_optimizer_class_name,
+            [{"params": self.critic_params, "lr": _critic_lr}],
+            _critic_lr,
+        )
+        self.disc_optimizer = make_optimizer(
+            disc_optimizer_class_name,
             [
                 {
                     "params": self.discriminator.trunk.parameters(),
                     "lr": _disc_lr,
-                    "weight_decay": 10e-4,
+                    "weight_decay": float(disc_weight_decay),
                 },
                 {
                     "params": self.discriminator.linear.parameters(),
                     "lr": _disc_lr,
-                    "weight_decay": 10e-2,
+                    "weight_decay": float(disc_head_weight_decay),
                 },
             ],
-            lr=_disc_lr,
+            _disc_lr,
         )
         # The adaptive-KL schedule may only move the ACTOR LR; the critic and the
         # discriminator keep their fixed rates. That is now structural (separate
@@ -248,6 +276,7 @@ class AMP_PPO:
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
+        self.action_bound_weight = float(action_bound_weight)
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
@@ -316,13 +345,23 @@ class AMP_PPO:
         rewards: torch.Tensor,
         dones: torch.Tensor,
         infos: dict,
+        timeout_values: Optional[torch.Tensor] = None,
     ) -> None:
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         if "time_outs" in infos:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device),
-                1,
+            # A timeout must bootstrap V(s_{t+1}), i.e. the final state captured
+            # before the environment resets. The legacy fallback below uses
+            # V(s_t) only for callers that have not supplied terminal values.
+            # AMPOnPolicyRunner supplies the correct values for feed-forward
+            # policies through PPOEnv's terminal_critic_obs field.
+            bootstrap_values = (
+                timeout_values
+                if timeout_values is not None
+                else self.transition.values.squeeze(-1)
+            )
+            self.transition.rewards += (
+                self.gamma * bootstrap_values * infos["time_outs"].to(self.device)
             )
         self.storage.add_transitions(self.transition)
         self.transition.clear()
@@ -489,6 +528,9 @@ class AMP_PPO:
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            action_bound_loss = (
+                torch.relu(mu_batch.abs() - 1.0).pow(2).sum(dim=-1).mean()
+            )
 
             # ----------------------------------------------------------
             # Value loss
@@ -520,6 +562,7 @@ class AMP_PPO:
 
             ppo_loss = (
                 surrogate_loss
+                + self.action_bound_weight * action_bound_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
             )
@@ -605,10 +648,19 @@ class AMP_PPO:
         if not self._rollout_disc_obs:
             return empty
 
-        # Fresh rollout observations, then hand them to the replay buffer.
+        # Fresh rollout observations. MimicKit fills the replay buffer with the
+        # complete rollout until capacity, then admits only
+        # `disc_replay_samples` fresh rows per iteration. This prevents a large
+        # vectorized rollout from replacing nearly the whole replay history.
         agent_obs = torch.cat(self._rollout_disc_obs, dim=0)
         self._rollout_disc_obs = []
-        self.amp_storage.insert(agent_obs)
+        if len(self.amp_storage) < self.amp_storage.buffer_size:
+            replay_insert = agent_obs
+        else:
+            insert_n = min(agent_obs.shape[0], self.disc_replay_samples)
+            insert_idx = torch.randperm(agent_obs.shape[0], device=dev)[:insert_n]
+            replay_insert = agent_obs[insert_idx]
+        self.amp_storage.insert(replay_insert)
 
         num_envs = self.storage.num_envs if self.storage is not None else 1
         batch_size = max(1, int(math.ceil(self.disc_batch_size * num_envs)))
@@ -624,14 +676,17 @@ class AMP_PPO:
         acc_policy_den = acc_expert_den = 0
 
         for _ in range(num_steps):
-            replay_obs = self.amp_storage.sample(self.disc_replay_samples)
-            pool = (
-                torch.cat([agent_obs, replay_obs], dim=0)
-                if replay_obs.shape[0] > 0
-                else agent_obs
+            # MimicKit samples a fresh batch from this rollout and an equally
+            # sized replay batch, then concatenates them. `disc_replay_samples`
+            # controls replay INSERTION once full; it is not the train-time
+            # replay batch size. The old implementation pooled 1000 replay rows
+            # with a 98k-row rollout, making replay only ~1% of the distribution.
+            fresh_idx = torch.randint(
+                0, agent_obs.shape[0], (batch_size,), device=dev
             )
-            idx = torch.randint(0, pool.shape[0], (batch_size,), device=dev)
-            policy_batch = pool[idx]
+            fresh_batch = agent_obs[fresh_idx]
+            replay_batch = self.amp_storage.sample(batch_size)
+            policy_batch = torch.cat([fresh_batch, replay_batch], dim=0)
             expert_batch = self.demo_fn(batch_size).to(dev)
 
             # One trunk forward for both the logits and the R1 penalty; the
@@ -641,7 +696,7 @@ class AMP_PPO:
             # Discriminator.compute_loss_fused.
             amp_loss, grad_pen_loss, policy_d, expert_d = self.discriminator.compute_loss_fused(
                 combined_obs=torch.cat([policy_batch, expert_batch], dim=0),
-                num_policy=batch_size,
+                num_policy=policy_batch.shape[0],
                 lambda_=self.grad_penalty_coeff,
                 two_sided=(self.mode == "add"),
             )
@@ -656,11 +711,7 @@ class AMP_PPO:
             disc_loss.backward()
             self.disc_optimizer.step()
 
-            # Update normaliser: for ADD, only use policy diffs (not zeros) so
-            # DiffNorm tracks the true diff scale, not an average with zero.
-            if self.mode == "add":
-                self.discriminator.update_normalization(policy_batch.detach())
-            else:
+            if self.mode != "add":
                 self.discriminator.update_normalization(
                     policy_batch.detach(), expert_batch.detach()
                 )
@@ -676,6 +727,13 @@ class AMP_PPO:
                 sum_acc_expert += (torch.round(expert_prob) == 1).sum()
                 acc_policy_den += policy_prob.numel()
                 acc_expert_den += expert_prob.numel()
+
+        if self.mode == "add":
+            # MimicKit freezes DiffNorm for the whole policy/discriminator
+            # update, then records the complete rollout once. Updating from each
+            # sampled minibatch made the classifier's coordinate system drift
+            # during the optimization loop.
+            self.discriminator.update_normalization(agent_obs.detach())
 
         return {
             "amp_loss": sum_amp_loss.item() / num_steps,

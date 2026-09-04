@@ -24,6 +24,7 @@ class ActorCritic(nn.Module):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=1.0,
+        actor_output_init_scale=None,
         **kwargs,
     ):
         if kwargs:
@@ -47,6 +48,18 @@ class ActorCritic(nn.Module):
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
         self.actor = nn.Sequential(*actor_layers)
+        if actor_output_init_scale is not None:
+            # MimicKit initializes only the Gaussian mean head in a very small
+            # uniform interval. PyTorch's default Linear initialization made the
+            # initial G1 policy much wider and contributed to PPO's first-update
+            # trust-region violation.
+            output = self.actor[-1]
+            nn.init.uniform_(
+                output.weight,
+                -float(actor_output_init_scale),
+                float(actor_output_init_scale),
+            )
+            nn.init.zeros_(output.bias)
 
         # Value function
         critic_layers = []
