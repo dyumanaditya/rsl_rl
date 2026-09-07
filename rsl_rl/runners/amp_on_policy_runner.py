@@ -34,6 +34,7 @@ from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormaliza
 from rsl_rl.modules.discriminator import Discriminator
 from rsl_rl.utils import store_code_state
 from utils.contact_force_logging import pop_contact_force_stats
+from utils.step_counting import pop_step_stats
 from utils.metric_logging import episode_tags, log_scalar_aliases
 
 
@@ -786,6 +787,13 @@ class AMPOnPolicyRunner:
         # substep records the sim accumulated; see utils/contact_force_logging.py
         # for how to read them when tuning cfg.sim.bundle_contact_force_thresh.
         for tag, value in pop_contact_force_stats(self.env).items():
+            self.writer.add_scalar(tag, value, locs["it"])
+
+        # Control-step / simulation-step counts of this iteration's rollout.
+        # Reports the interaction budget (env transitions) separately from the
+        # physics budget (integrator advances), which differ by sim.sim_substeps
+        # here and by much more under sim.mode=bundle. See utils/step_counting.py.
+        for tag, value in pop_step_stats(self.env).items():
             self.writer.add_scalar(tag, value, locs["it"])
 
         if len(locs["rewbuffer"]) > 0:
