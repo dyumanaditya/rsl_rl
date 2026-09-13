@@ -238,6 +238,15 @@ class AMPOnPolicyRunner:
 
         self.num_steps_per_env: int = self.cfg["num_steps_per_env"]
         self.save_interval: int = self.cfg["save_interval"]
+        # Which checkpoints go to wandb/neptune: "final" (default), "all", or
+        # "none". Every checkpoint is written to log_dir regardless. At ~19 MB
+        # each, uploading all of them was ~85% of a PPO run's wandb storage
+        # (~0.9 of 1.1 GB for 5000 iterations at save_interval=100).
+        self.upload_checkpoints = str(self.cfg.get("upload_checkpoints", "final")).lower()
+        if self.upload_checkpoints not in ("final", "all", "none"):
+            raise ValueError(
+                f"runner upload_checkpoints must be 'final', 'all' or 'none', got {self.upload_checkpoints!r}"
+            )
         self.empirical_normalization: bool = self.cfg.get("empirical_normalization", False)
 
         # Action-rate regularisation (BeyondMimic action_rate_l2), byte-for-byte
@@ -650,7 +659,7 @@ class AMPOnPolicyRunner:
                         self.writer.save_file(path)
 
         if self.log_dir is not None:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"), final=True)
 
     # ------------------------------------------------------------------
     # Logging
@@ -829,7 +838,7 @@ class AMPOnPolicyRunner:
     # Save / load / inference
     # ------------------------------------------------------------------
 
-    def save(self, path: str, infos=None):
+    def save(self, path: str, infos=None, final: bool = False):
         saved_dict = {
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
@@ -850,7 +859,8 @@ class AMPOnPolicyRunner:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
         torch.save(saved_dict, path)
-        if self.logger_type in ["neptune", "wandb"]:
+        upload = self.upload_checkpoints == "all" or (self.upload_checkpoints == "final" and final)
+        if self.logger_type in ["neptune", "wandb"] and upload:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path: str, load_optimizer: bool = True):

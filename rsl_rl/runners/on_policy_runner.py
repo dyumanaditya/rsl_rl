@@ -75,6 +75,15 @@ class OnPolicyRunner:
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+        # Which checkpoints go to wandb/neptune: "final" (default), "all", or
+        # "none". Every checkpoint is written to log_dir regardless. At ~19 MB
+        # each, uploading all of them was ~85% of a PPO run's wandb storage
+        # (~0.9 of 1.1 GB for 5000 iterations at save_interval=100).
+        self.upload_checkpoints = str(self.cfg.get("upload_checkpoints", "final")).lower()
+        if self.upload_checkpoints not in ("final", "all", "none"):
+            raise ValueError(
+                f"runner upload_checkpoints must be 'final', 'all' or 'none', got {self.upload_checkpoints!r}"
+            )
         self.empirical_normalization = self.cfg["empirical_normalization"]
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
@@ -333,7 +342,7 @@ class OnPolicyRunner:
 
         # Save the final model after training
         if self.log_dir is not None:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"), final=True)
 
     def _update_discriminator(self) -> dict:
         """Train discriminator (AMP / ADD) on the full rollout's disc_obs.
@@ -516,7 +525,7 @@ class OnPolicyRunner:
         )
         print(log_string)
 
-    def save(self, path: str, infos=None):
+    def save(self, path: str, infos=None, final: bool = False):
         # -- Save PPO model
         saved_dict = {
             "model_state_dict": self.alg.actor_critic.state_dict(),
@@ -535,7 +544,8 @@ class OnPolicyRunner:
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"]:
+        upload = self.upload_checkpoints == "all" or (self.upload_checkpoints == "final" and final)
+        if self.logger_type in ["neptune", "wandb"] and upload:
             self.writer.save_model(path, self.current_learning_iteration)
 
         # Save discriminator alongside the policy checkpoint
